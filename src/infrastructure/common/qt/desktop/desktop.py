@@ -10,8 +10,12 @@ from domain.input.vocabulary import Event
 from domain.input.pad_control import PadControl
 from domain.navigation import hints as home_hints
 from infrastructure.common.qt.overlays.info_dialog import InfoDialog
+from infrastructure.common.qt.overlays.setup_overlay import QtSetupView
 from infrastructure.common.qt.overlays.notifications_overlay import NotificationsOverlay
 from infrastructure.common.qt.overlays.network_overlay import NetworkOverlay
+from infrastructure.common.qt.overlays.configuration_overlay import ConfigurationOverlay
+from domain.audio.kasual_output import OutputPicker
+from domain.display.selection import DisplaySelection
 from domain.notifications.center import NotificationCenter
 from domain.network.control import NetworkControl
 from domain.network.status import NetworkStatus
@@ -25,6 +29,7 @@ from domain.menu.dispatcher import TileMenuDispatcher
 from domain.navigation.focus_navigator import FocusNavigator
 from domain.navigation.tile_mover import TileMover
 from domain.provisioning.add_apps import AppAdder
+from domain.setup.gate import SetupGate
 from domain.shared.feedback import Feedback
 from domain.shell.desktop_view import DesktopView
 from domain.shell.desktop_control import DesktopControl
@@ -32,15 +37,18 @@ from domain.shell.home_actions import HomeActions
 from domain.shell.home_chrome import HomeChrome
 from domain.shell.introspection import (
     HEADER, TILES, ConfirmSnapshot, FocusSnapshot, HomeMenuSnapshot, MenuItemSnapshot,
-    MenuSectionSnapshot, ShellSnapshot, TileSnapshot,
+    MenuSectionSnapshot, ShellSnapshot, TileMenuSnapshot, TileSnapshot,
 )
 from domain.shell.open_overlays import OpenOverlays
 from domain.system.desktop_shell import DesktopShell
 from domain.shell.wallpaper import SystemWallpaper
 from infrastructure.common.qt._meta import ProtocolQtMeta
 from infrastructure.common.qt.ui.nav_key_map import nav_key_map
+from infrastructure.common.qt.ui.screen_watcher import ScreenWatcher
+from infrastructure.common.qt.ui.target_screen import place_on_target_screen
 from .app_add_controller import AppAddController
 from .dialog_host_controller import DialogHostController
+from .setup_check_controller import SetupCheckController
 from .hint_bar import HintBar
 from .home_surface import HomeSurface
 from .power_popover_controller import PowerPopoverController
@@ -74,10 +82,14 @@ class Desktop(QWidget, DesktopView, DesktopShell, DesktopControl, metaclass=Prot
         process_manager: ProcessManager,
         notifications: NotificationCenter,
         network_control: NetworkControl,
+        displays: DisplaySelection,
+        audio_output: OutputPicker,
         overlays: OpenOverlays,
         surface: DesktopSurface | None = None,
         parent_of: 'Callable[[int], int | None] | None' = None,
         app_adder: AppAdder | None = None,
+        setup_gate: SetupGate | None = None,
+        setup_view: QtSetupView | None = None,
     ):
         super().__init__()
         self._apps        = apps
@@ -88,6 +100,8 @@ class Desktop(QWidget, DesktopView, DesktopShell, DesktopControl, metaclass=Prot
         self._app_manager = process_manager
         self._notifications = notifications
         self._network_control = network_control
+        self._displays = displays
+        self._audio_output = audio_output
         # System-action overlays (volume/brightness/…) and the dialog/popover
         # handles (confirm, tile settings, tile popover) are tracked as a group
         # in this shared registry.
@@ -111,6 +125,7 @@ class Desktop(QWidget, DesktopView, DesktopShell, DesktopControl, metaclass=Prot
         # On Wayland this promotes the widget to a layer-shell TOP surface (above
         # DE panels; the Home Overlay still renders above it).
         self._surface.install(self)
+        place_on_target_screen(self)
 
         main = QVBoxLayout(self)
         main.setContentsMargins(0, 0, 0, 0)
@@ -141,8 +156,11 @@ class Desktop(QWidget, DesktopView, DesktopShell, DesktopControl, metaclass=Prot
         self._hintbar = HintBar()
         self._hintbar.install_surface()
 
-        # The [＋] add-app flow lives in its own controller; the tile bar's
-        # add-requested signal drives it directly.
+        self._gamepad_access = SetupCheckController(
+            setup_gate, setup_view, self._overlays, self._hintbar,
+            restore_hints=lambda: self._nav.render() if self._nav else None,
+        )
+
         self._app_add = AppAddController(
             self._apps, self._app_adder, self._gamepad, self._feedback,
             self._tilebar, self._overlays, self._hintbar,
@@ -174,6 +192,9 @@ class Desktop(QWidget, DesktopView, DesktopShell, DesktopControl, metaclass=Prot
         self._wallpaper_scaled: 'QPixmap | None' = None
 
         self._wm.on_windows_updated(self._tilebar.update_windows)
+
+        self._screen_watcher = ScreenWatcher(self.sync_screen, parent=self)
+        self._screen_watcher.follow(self.windowHandle())
 
         # Desktop is not shown at startup — build_desktop wires it via attach(),
         # then it is revealed on the connected_changed(True) signal.
@@ -217,6 +238,7 @@ class Desktop(QWidget, DesktopView, DesktopShell, DesktopControl, metaclass=Prot
         # Not windows_changed: an app's own window is no dynamic tile, so its
         # disappearance rebuilds nothing and the deferred return would never finish.
         self._wm.on_windows_updated(lambda _w: self._lifecycle.check_pending_return())
+        self._wm.on_windows_updated(lambda _w: self._lifecycle.check_awaited_launch())
         self._app_manager.on_finished(
             lambda e: self._lifecycle.on_app_finished(e.app_id))
         self._app_manager.on_launch_failed(
@@ -258,6 +280,19 @@ class Desktop(QWidget, DesktopView, DesktopShell, DesktopControl, metaclass=Prot
             ),
         )
 
+    def _tile_menu_snapshot(self) -> TileMenuSnapshot:
+        popover = self._dialogs.active_tile_popover if self._dialogs is not None else None
+        if popover is None:
+            return TileMenuSnapshot(open=False)
+        return TileMenuSnapshot(
+            open=True,
+            items=tuple(
+                MenuItemSnapshot(label=item.label, action=item.action,
+                                 focused=(index == popover.focused_index))
+                for index, item in enumerate(popover.items)
+            ),
+        )
+
     def _confirm_snapshot(self) -> ConfirmSnapshot:
         dialog = self._dialogs.active_confirm if self._dialogs is not None else None
         if dialog is None:
@@ -269,8 +304,10 @@ class Desktop(QWidget, DesktopView, DesktopShell, DesktopControl, metaclass=Prot
         )
 
     def snapshot(self) -> ShellSnapshot:
+        windows = self._tilebar.last_windows
         tiles = tuple(
-            TileSnapshot(index=i, app_id=app.id, name=app.name)
+            TileSnapshot(index=i, app_id=app.id, name=app.name,
+                         running=self._tilebar.is_tile_running(i, windows))
             for i, app in enumerate(self._apps)
         )
         on_tiles = self._nav is None or self._nav.in_tiles
@@ -280,16 +317,19 @@ class Desktop(QWidget, DesktopView, DesktopShell, DesktopControl, metaclass=Prot
         )
         return ShellSnapshot(
             desktop_visible=self._surface.is_visible(),
-            desktop_mapped=self.isVisible(),
+            desktop_mapped=self._surface.is_on_screen(),
             desktop_sunk=self._surface.is_sunk(),
             home_header_mapped=(
-                self._home_surface is not None and self._home_surface.isVisible()
+                self._home_surface is not None and self._home_surface.is_on_screen()
             ),
-            hint_bar_mapped=self._hintbar.isVisible(),
+            hint_bar_mapped=self._hintbar.is_on_screen(),
             home_menu=self._home_menu_snapshot(),
+            tile_menu=self._tile_menu_snapshot(),
             confirm=self._confirm_snapshot(),
             focus=FocusSnapshot(
                 zone=TILES if on_tiles else HEADER,
+                cursor=self._tilebar.cursor_index() if on_tiles else None,
+                kind=self._tilebar.current_kind() if on_tiles else None,
                 tile_index=index,
                 app_id=tiles[index].app_id if index is not None and index < len(tiles) else None,
             ),
@@ -328,6 +368,7 @@ class Desktop(QWidget, DesktopView, DesktopShell, DesktopControl, metaclass=Prot
         self._overlays.cancel()
         self._dialogs.cancel()
         self._app_add.cancel()
+        self._gamepad_access.cancel()
         if self._tile_mover is not None:
             self._tile_mover.cancel()
 
@@ -337,7 +378,7 @@ class Desktop(QWidget, DesktopView, DesktopShell, DesktopControl, metaclass=Prot
         self._desktop.resume()
 
     def withdraw(self) -> None:
-        """Leave the screen when the controller goes away, chrome included."""
+        self._chrome.drop_open_menu()
         self.withdraw_view()
 
     # ── Hint bar / Home chrome (decisions live in the HomeChrome coordinator) ─
@@ -421,6 +462,14 @@ class Desktop(QWidget, DesktopView, DesktopShell, DesktopControl, metaclass=Prot
         self._wallpaper_scaled = None
         if hasattr(self, '_tilebar'):
             QTimer.singleShot(0, self._tilebar.center_current)
+
+    def sync_screen(self) -> None:
+        self._wallpaper_scaled = None
+        self.update()
+        self._tilebar.sync_screen_metrics()
+        if self._home_surface is not None:
+            self._home_surface.position_at_top()
+        self._hintbar.position_at_bottom()
 
     def _load_wallpaper_pixmap(self) -> 'QPixmap | None':
         """Render the domain wallpaper (a path) into a QPixmap for painting.
@@ -566,13 +615,24 @@ class Desktop(QWidget, DesktopView, DesktopShell, DesktopControl, metaclass=Prot
     def update_network_status(self, status: NetworkStatus) -> None:
         self._chrome.update_network_status(status)
 
+    def open_configuration_overlay(self) -> None:
+        overlay = ConfigurationOverlay(
+            self._gamepad, self._displays, self._audio_output, self._feedback,
+            parent=self, dim=False,
+        )
+        self._dialogs.present(overlay)
+        self._hintbar.show_hints(home_hints.CONFIGURATION)
+
     def open_network_overlay(self) -> None:
         overlay = NetworkOverlay(
-            self._gamepad, self._chrome.network_status, self._network_control,
-            self._feedback, parent=self, dim=False,
+            self._gamepad, self._chrome.network_status, self._chrome.network_icon,
+            self._network_control, self._feedback, parent=self, dim=False,
         )
         self._dialogs.present(overlay)
         self._hintbar.show_hints(home_hints.NETWORK)
+
+    def open_gamepad_access_check(self) -> None:
+        self._gamepad_access.show()
 
     def open_notifications_overlay(self) -> None:
         self._chrome.open_notifications()

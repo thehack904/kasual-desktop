@@ -13,7 +13,7 @@ import pytest
 
 from domain.catalog.window import Window
 from domain.shell.wallpaper import Wallpaper
-from infrastructure.common.qt.ui.layer_shell import Anchor, Layer
+from infrastructure.common.qt.ui.layer_shell import Anchor, Keyboard, Layer
 from infrastructure.gnome.display.wallpaper import GnomeSystemWallpaper
 from infrastructure.gnome.qt.surface import GnomeSurface
 from infrastructure.gnome.wm.window_manager import GnomeWindowManager
@@ -189,10 +189,11 @@ class TestGnomeSurface:
         with patch("infrastructure.gnome.qt.surface.helper.set_surface_role") as role:
             GnomeSurface().install(widget)
         widget.setWindowTitle.assert_called_once_with("Kasual Desktop")
-        title, layer, anchors = role.call_args.args
+        title, layer, anchors, keyboard = role.call_args.args
         assert title == "Kasual Desktop"
         assert layer == Layer.TOP < Layer.OVERLAY
         assert anchors == Anchor.ALL
+        assert keyboard != Keyboard.NONE   # the one surface of ours that is focused
 
     def test_show_fullscreen_asks_for_the_screen_before_mapping(self, qapp):
         """The pin must precede the map: Mutter scans a fullscreen window straight
@@ -336,3 +337,14 @@ class TestGnomeWallpaper:
         with patch("infrastructure.gnome.display.wallpaper.subprocess.run",
                    side_effect=FileNotFoundError):
             assert GnomeSystemWallpaper().current() is None
+
+
+class TestGnomePrimaryDisplay:
+    def test_lends_and_reclaims_through_the_helper(self):
+        from infrastructure.gnome.display.primary import GnomePrimaryDisplay
+        with patch("infrastructure.gnome.helper.call") as call:
+            primary = GnomePrimaryDisplay()
+            primary.lend_to_kasual_screen()
+            primary.reclaim()
+        assert [c.args for c in call.call_args_list] == [
+            ("LendPrimaryMonitor",), ("ReclaimPrimaryMonitor",)]

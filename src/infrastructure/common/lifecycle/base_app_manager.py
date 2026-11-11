@@ -21,6 +21,7 @@ from domain.lifecycle.app_events import AppStarted, AppFinished, AppLaunchFailed
 from domain.lifecycle.process_manager import ProcessManager
 from domain.shared.event_emitter import EventEmitter, Unsubscribe
 from infrastructure.common.qt._meta import ProtocolQtMeta
+from version import test_api_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,9 @@ class BaseAppManager(QObject, ProcessManager, metaclass=ProtocolQtMeta):
     def _build_env(self, env: Mapping[str, str] | None) -> dict[str, str]:
         proc_env = os.environ.copy()
         self._prepare_env(proc_env)
+        # In dev the flag is implied by the source checkout, never exported — hand it down.
+        if test_api_enabled():
+            proc_env["KD_TEST_API"] = "1"
         proc_env.update(env or {})
         return proc_env
 
@@ -120,8 +124,8 @@ class BaseAppManager(QObject, ProcessManager, metaclass=ProtocolQtMeta):
             logger.warning("Force killing app %s", app_id)
             try:
                 self._force_kill_proc(proc)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Force kill of %s failed: %s", app_id, exc)
 
     def _monitor(self, proc: Proc) -> None:
         self._wait_for_exit(proc)

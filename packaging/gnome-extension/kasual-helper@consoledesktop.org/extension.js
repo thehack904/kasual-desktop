@@ -3,6 +3,7 @@ import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const TAG = '[kasual-helper]';
@@ -40,7 +41,13 @@ const IFACE = `
       <arg type="s" direction="in" name="title"/>
       <arg type="i" direction="in" name="layer"/>
       <arg type="i" direction="in" name="anchors"/>
+      <arg type="i" direction="in" name="keyboard"/>
     </method>
+    <method name="SetTargetMonitor">
+      <arg type="s" direction="in" name="connector"/>
+    </method>
+    <method name="LendPrimaryMonitor"/>
+    <method name="ReclaimPrimaryMonitor"/>
     <method name="ActivateSurface">
       <arg type="s" direction="in" name="title"/>
     </method>
@@ -70,7 +77,19 @@ const IFACE = `
 // The layer-shell vocabulary Kasual speaks (infrastructure/common/qt/ui/layer_shell.py).
 const ANCHOR_TOP = 1, ANCHOR_BOTTOM = 2, ANCHOR_LEFT = 4, ANCHOR_RIGHT = 8;
 const DEFAULT_LAYER = 3;
+const NO_MONITOR = -1;
 const OVERLAY_LAYER = 3;
+const KEYBOARD_NONE = 0;
+
+const DISPLAY_CONFIG = ['org.gnome.Mutter.DisplayConfig',
+    '/org/gnome/Mutter/DisplayConfig', 'org.gnome.Mutter.DisplayConfig'];
+const APPLY_TEMPORARILY = 1;
+const MONITOR_PROPERTIES_KEPT = ['color-mode', 'rgb-range'];
+
+const CHROME_SETTLE_MS = [100, 1000];
+
+const FOCUS_RETRY_MS = 100;
+const FOCUS_ATTEMPTS = 20;
 
 // Mutter moved the unredirect toggle from Meta to global.compositor across 45–50.
 function unredirectApi() {
@@ -105,11 +124,57 @@ function raiseWindow(w) {
     else if (typeof w.raise === 'function') w.raise();
 }
 
+function defaultSeat() {
+    const backend = typeof Clutter.get_default_backend === 'function'
+        ? Clutter.get_default_backend()
+        : global.stage.context.get_backend();
+    return backend.get_default_seat();
+}
+
 function lowerWindow(w) {
     if (typeof w.lower_with_transients === 'function')
         w.lower_with_transients(global.get_current_time());
     else if (typeof w.lower === 'function')
         w.lower();
+}
+
+let loggedNoSetType = false;
+
+// Measured on Mutter 50: a DOCK window is not focused as it maps, a NORMAL one is.
+function denyFocus(win) {
+    if (win.get_window_type() === Meta.WindowType.DOCK)
+        return;
+    if (typeof win.set_type !== 'function') {
+        if (!loggedNoSetType) {
+            loggedNoSetType = true;
+            console.log(`${TAG} Meta.Window.set_type is missing: overlays will take the focus`);
+        }
+        return;
+    }
+    win.set_type(Meta.WindowType.DOCK);
+}
+
+const DEEPEST_LAUNCH_CHAIN = 64;
+
+function parentPid(pid) {
+    try {
+        const [, bytes] = GLib.file_get_contents(`/proc/${pid}/stat`);
+        const stat = new TextDecoder().decode(bytes);
+        const stateAndParent = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+        return parseInt(stateAndParent[1]) || 0;
+    } catch (e) {
+        return 0;
+    }
+}
+
+function descendsFrom(pid, ancestor) {
+    let current = pid;
+    for (let depth = 0; depth < DEEPEST_LAUNCH_CHAIN && current > 1; depth++) {
+        if (current === ancestor)
+            return true;
+        current = parentPid(current);
+    }
+    return false;
 }
 
 function mappedWindows() {
@@ -149,6 +214,54 @@ function stackedBottomToTop(windows) {
     return global.display.sort_windows_by_stacking(windows);
 }
 
+function callDisplayConfig(method, parameters, onReply) {
+    Gio.DBus.session.call(...DISPLAY_CONFIG, method, parameters, null,
+        Gio.DBusCallFlags.NONE, -1, null, (bus, result) => {
+            try {
+                onReply?.(bus.call_finish(result).deepUnpack());
+            } catch (e) {
+                console.log(`${TAG} DisplayConfig.${method} failed: ${e.message}`);
+            }
+        });
+}
+
+function currentModes(monitors) {
+    const modes = new Map();
+    for (const [[connector], modeList, properties] of monitors) {
+        const current = modeList.find(mode => mode[6]['is-current']?.deepUnpack());
+        if (current)
+            modes.set(connector, {id: current[0], properties});
+    }
+    return modes;
+}
+
+function keptMonitorProperties(properties) {
+    const kept = {};
+    for (const key of MONITOR_PROPERTIES_KEPT)
+        if (key in properties)
+            kept[key] = properties[key];
+    return kept;
+}
+
+function primaryConnectorOf(logicalMonitors) {
+    const primary = logicalMonitors.find(logical => logical[4]);
+    return primary ? primary[5][0][0] : '';
+}
+
+function configWithPrimary(logicalMonitors, modes, connector) {
+    return logicalMonitors.map(([x, y, scale, transform, , monitors]) => {
+        const connectors = monitors.map(([name]) => name);
+        return [x, y, scale, transform, connectors.includes(connector),
+            connectors.map(name => [name, modes.get(name).id,
+                keptMonitorProperties(modes.get(name).properties)])];
+    });
+}
+
+function layoutProperties(properties) {
+    return properties['supports-changing-layout-mode']?.deepUnpack()
+        ? {'layout-mode': properties['layout-mode']} : {};
+}
+
 class Helper {
     constructor() {
         this._dbus = Gio.DBusExportedObject.wrapJSObject(IFACE, this);
@@ -163,6 +276,10 @@ class Helper {
         this._windowWatch = false;
         this._virtualPointer = null;
         this._roles = new Map();
+        this._targetConnector = '';
+        this._desktopMonitor = NO_MONITOR;
+        this._primaryLent = false;
+        this._primaryOwner = '';
         this._pinned = new Set();
         this._unredirectApi = null;
         this._restackedId = 0;
@@ -171,14 +288,21 @@ class Helper {
         this._anchorPending = new Set();
         this._restacking = false;
         this._pendingFocus = null;
+        this._focusSourceId = 0;
+        this._focusAttempts = 0;
         this._windowSignals = new Map();
         this._realGetRunning = null;
+        this._chromeSettleIds = [];
 
         this._hideFromAppLists();
         this._windowCreatedId = global.display.connect(
-            'window-created', (_d, win) => this._trackWindow(win));
-        this._attentionId = global.display.connect(
-            'window-demands-attention', (_d, win) => this._muteAttention(win));
+            'window-created', (_d, win) => {
+                this._trackWindow(win);
+                this._bringToKasualOnceShown(win);
+            });
+        this._suppressReadyBannerForOwnWindows();
+        this._monitorsChangedId = Main.layoutManager.connect(
+            'monitors-changed', () => this._recheckChromeOnceSettled());
         // A ceded Desktop's depth follows the focus (see _focusIsOrdinaryWindow).
         this._focusId = global.display.connect('notify::focus-window', () => {
             this._scheduleSync();
@@ -191,19 +315,23 @@ class Helper {
     }
 
     destroy() {
-        for (const id of [this._syncSourceId, this._anchorSourceId])
+        for (const id of [this._syncSourceId, this._anchorSourceId, this._focusSourceId])
             if (id)
                 GLib.source_remove(id);
         this._syncSourceId = 0;
         this._anchorSourceId = 0;
+        this._focusSourceId = 0;
         global.display.disconnect(this._windowCreatedId);
-        global.display.disconnect(this._attentionId);
+        Main.layoutManager.disconnect(this._monitorsChangedId);
+        this._forgetChromeRechecks();
+        this._restoreReadyBanner();
         global.display.disconnect(this._focusId);
         for (const [win, ids] of this._windowSignals)
             for (const id of ids)
                 win.disconnect(id);
         this._windowSignals.clear();
         this._showFromAppLists();
+        this.ReclaimPrimaryMonitor();
         this._virtualPointer = null;
         this._appClass = null;
         this._sync();
@@ -222,20 +350,28 @@ class Helper {
         // Only Kasual's own windows matter here; a terminal's spinner retitling
         // itself ten times a second must not restack the session.
         const syncIfOurs = () => {
-            if (this._isOurs(win))
+            if (this._isOurs(win)) {
+                // Not on the idle sync: Mutter focuses the window as it maps, next.
+                this._applyFocusPolicy(win);
                 this._scheduleSync();
+            }
         };
         this._windowSignals.set(win, [
             // An XWayland window (every Steam game) is created before its WM_CLASS
             // arrives: this, not window-created, is where it becomes identifiable.
             win.connect('notify::wm-class', () => {
                 this._suppressScanoutForOurs(win);
+                this._applyFocusPolicy(win);
                 this._scheduleSync();
                 this._emitWindows('class');
             }),
             win.connect('notify::title', syncIfOurs),
             // Fullscreen toggles change what must sit over a ceded Desktop.
             win.connect('notify::fullscreen', () => {
+                if (this._isOurs(win))
+                    this._moveToTargetMonitor(win);
+                else if (win.is_fullscreen())
+                    this._bringToKasual(win);
                 this._scheduleSync();
                 this._emitWindows('fullscreen');
             }),
@@ -253,6 +389,7 @@ class Helper {
             this._emitWindows('removed');
         }));
         this._suppressScanoutForOurs(win);
+        this._applyFocusPolicy(win);
         this._scheduleSync();
         this._emitWindows('added');
     }
@@ -290,27 +427,105 @@ class Helper {
             this._setUnredirectSuppressed(true);
     }
 
-    // Mutter flags any window that maps without taking focus, and the Shell turns
-    // the flag into a "window is ready" banner. Kasual's surfaces map unfocused by
-    // design; clearing the flag inside the emission tears the notification down
-    // before the message tray gets to show it.
-    _muteAttention(win) {
-        if (this._isOurs(win))
-            win.unset_demands_attention();
+    // The "window is ready" banner. Bound to the Shell handler at its own
+    // construction, so its connections are replaced, not the method overridden.
+    _suppressReadyBannerForOwnWindows() {
+        const banner = Main.windowAttentionHandler;
+        const attentionSignals = [
+            ['_windowDemandsAttentionId', 'window-demands-attention'],
+            ['_windowMarkedUrgentId', 'window-marked-urgent'],
+        ];
+        if (banner && attentionSignals.every(([id]) => banner[id])) {
+            this._bannerFilter = {banner, attentionSignals};
+            for (const [id, signal] of attentionSignals) {
+                global.display.disconnect(banner[id]);
+                banner[id] = global.display.connect(signal, (display, window) => {
+                    if (!(window && this._isOurs(window)))
+                        banner._onWindowDemandsAttention(display, window);
+                });
+            }
+            return;
+        }
+        if (typeof banner?._onWindowDemandsAttention === 'function') {
+            this._filterTrackedBanner(banner);
+            return;
+        }
+        // Shell internals moved: fall back to clearing the flag post-hoc.
+        this._flagClearId = global.display.connect(
+            'window-demands-attention', (_d, win) => {
+                if (this._isOurs(win))
+                    win.unset_demands_attention();
+            });
+    }
+
+    _filterTrackedBanner(banner) {
+        const skipOurs = (display, window) => {
+            if (!(window && this._isOurs(window)))
+                banner._onWindowDemandsAttention(display, window);
+        };
+        this._trackedBanner = banner;
+        global.display.disconnectObject(banner);
+        global.display.connectObject(
+            'window-demands-attention', skipOurs,
+            'window-marked-urgent', skipOurs,
+            banner);
+    }
+
+    _restoreTrackedBanner() {
+        const banner = this._trackedBanner;
+        const showBanner = banner._onWindowDemandsAttention.bind(banner);
+        this._trackedBanner = null;
+        global.display.disconnectObject(banner);
+        global.display.connectObject(
+            'window-demands-attention', showBanner,
+            'window-marked-urgent', showBanner,
+            banner);
+    }
+
+    _restoreReadyBanner() {
+        if (this._flagClearId) {
+            global.display.disconnect(this._flagClearId);
+            this._flagClearId = 0;
+            return;
+        }
+        if (this._trackedBanner) {
+            this._restoreTrackedBanner();
+            return;
+        }
+        const filter = this._bannerFilter;
+        if (!filter)
+            return;
+        this._bannerFilter = null;
+        for (const [id, signal] of filter.attentionSignals) {
+            global.display.disconnect(filter.banner[id]);
+            filter.banner[id] = global.display.connect(
+                signal, filter.banner._onWindowDemandsAttention.bind(filter.banner));
+        }
     }
 
     _roleOf(win) {
         return this._isOurs(win) ? this._roles.get(win.get_title()) : undefined;
     }
 
+    _applyFocusPolicy(win) {
+        const role = this._roleOf(win);
+        if (role && role.keyboard === KEYBOARD_NONE)
+            denyFocus(win);
+    }
+
     // Wayland gives placement to the compositor and size to the client, so only
     // the position is ours: resizing here would hand Qt a buffer it never repaints.
     _applyAnchor(win) {
         const role = this._roleOf(win);
-        if (!role || !role.anchors || win.is_fullscreen())
+        if (!role || !role.anchors)
             return;
+        if (win.is_fullscreen()) {
+            this._moveToTargetMonitor(win);
+            this._gatherAroundDesktop(win);
+            return;
+        }
 
-        const index = win.get_monitor();
+        const index = this._monitorKasualLivesOn(win);
         const monitor = global.display.get_monitor_geometry(
             index >= 0 ? index : global.display.get_primary_monitor());
         const frame = win.get_frame_rect();
@@ -329,8 +544,90 @@ class Helper {
             win.move_frame(true, x, y);
     }
 
+    _monitorKasualLivesOn(win) {
+        const kasualMonitor = this._kasualMonitor();
+        return kasualMonitor !== NO_MONITOR ? kasualMonitor : win.get_monitor();
+    }
+
+    _launchedByKasual(win) {
+        const kasual = this._ourWindows()[0];
+        return !!kasual && descendsFrom(win.get_pid(), kasual.get_pid());
+    }
+
+    _kasualMonitor() {
+        const chosen = this._chosenMonitor();
+        if (chosen !== NO_MONITOR)
+            return chosen;
+        const desktopMonitorStillExists = this._desktopMonitor !== NO_MONITOR
+            && this._desktopMonitor < global.display.get_n_monitors();
+        return desktopMonitorStillExists ? this._desktopMonitor : NO_MONITOR;
+    }
+
+    _bringToKasualOnceShown(win) {
+        const shownId = win.connect('shown', () => {
+            win.disconnect(shownId);
+            this._bringToKasual(win);
+        });
+    }
+
+    _bringToKasual(win) {
+        const launchedApp = !this._isOurs(win)
+            && win.get_window_type() === Meta.WindowType.NORMAL
+            && this._launchedByKasual(win);
+        const kasualMonitor = this._kasualMonitor();
+        if (launchedApp && kasualMonitor !== NO_MONITOR && win.get_monitor() !== kasualMonitor)
+            win.move_to_monitor(kasualMonitor);
+    }
+
+    _gatherAroundDesktop(desktop) {
+        const index = desktop.get_monitor();
+        if (index === NO_MONITOR || index === this._desktopMonitor)
+            return;
+        this._desktopMonitor = index;
+        for (const w of this._ourWindows())
+            if (w !== desktop)
+                this._scheduleAnchor(w);
+    }
+
+    _chosenMonitor() {
+        if (!this._targetConnector)
+            return NO_MONITOR;
+        return global.backend.get_monitor_manager()
+            .get_monitor_for_connector(this._targetConnector);
+    }
+
+    _moveToTargetMonitor(win) {
+        const chosen = this._chosenMonitor();
+        if (chosen === NO_MONITOR || win.get_monitor() === chosen)
+            return;
+        if (win.is_fullscreen())
+            win.move_to_monitor(chosen);
+        else
+            this._scheduleAnchor(win);
+    }
+
     // A frame rect read straight from 'size-changed' can still be the size we
     // requested rather than the one the client committed.
+    _recheckChromeOnceSettled() {
+        this._forgetChromeRechecks();
+        if (typeof Main.layoutManager._updateVisibility !== 'function')
+            return;
+        this._chromeSettleIds = CHROME_SETTLE_MS.map(delay => {
+            const sourceId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
+                this._chromeSettleIds = this._chromeSettleIds.filter(id => id !== sourceId);
+                Main.layoutManager._updateVisibility();
+                return GLib.SOURCE_REMOVE;
+            });
+            return sourceId;
+        });
+    }
+
+    _forgetChromeRechecks() {
+        for (const id of this._chromeSettleIds)
+            GLib.source_remove(id);
+        this._chromeSettleIds = [];
+    }
+
     _scheduleAnchor(win) {
         this._anchorPending.add(win);
         if (this._anchorSourceId)
@@ -375,8 +672,10 @@ class Helper {
                 w.unmake_above();
         this._pinned = new Set(wanted);
 
-        for (const w of wanted)
+        for (const w of wanted) {
             this._applyAnchor(w);
+            this._applyFocusPolicy(w);
+        }
 
         // Desktop above ordinary windows, below every fullscreen app. make_above
         // would lift the fullscreen Desktop to the TOP layer over the app (Mutter
@@ -396,7 +695,8 @@ class Helper {
             // Only an overlay needs the app redirected; the ceded Desktop is happy
             // to stay under a scanned-out game.
             this._setUnredirectSuppressed(overlays.length > 0);
-            this._setRestackGuard(false);
+            // A game that keeps the focus restacks itself; the overlays must go back up.
+            this._setRestackGuard(overlays.length > 0);
             return;
         }
 
@@ -465,7 +765,8 @@ class Helper {
     }
 
     // Layer, not map order, decides: the Desktop must stay below the overlays even
-    // when it is re-shown — and so re-mapped — after them.
+    // when it is re-shown — and so re-mapped — after them. Ceded, only the overlays:
+    // raising the Desktop there would bury the game.
     _reassertStacking() {
         if (this._restacking)
             return;
@@ -474,10 +775,12 @@ class Helper {
             return;
 
         const layerOf = w => this._roleOf(w)?.layer ?? DEFAULT_LAYER;
-        const ordered = ours
+        const ordered = (this._ceded ? ours.filter(w => this._isOverlay(w)) : ours)
             .map((w, depth) => ({w, depth}))
             .sort((a, b) => layerOf(a.w) - layerOf(b.w) || a.depth - b.depth)
             .map(({w}) => w);
+        if (!ordered.length)
+            return;
 
         // Raising emits 'restacked', so without a fixpoint every pass feeds the next.
         const all = stackedBottomToTop(mappedWindows());
@@ -531,6 +834,7 @@ class Helper {
             unredirect: unredirectApi(),
             raise: (typeof Meta.Window.prototype.raise_and_make_recent === 'function')
                 ? 'raise_and_make_recent' : 'raise',
+            setType: typeof Meta.Window.prototype.set_type === 'function',
         });
     }
 
@@ -540,6 +844,7 @@ class Helper {
         return JSON.stringify({
             appClass: this._appClass,
             pendingFocus: this._pendingFocus,
+            focusAttempts: this._focusAttempts,
             pinned: this._pinned.size,
             unredirect: this._unredirectApi,
             monitor: rect(global.display.get_monitor_geometry(primary)),
@@ -548,6 +853,22 @@ class Helper {
             workArea: rect(global.workspace_manager
                 .get_active_workspace().get_work_area_for_monitor(primary)),
             roles: [...this._roles].map(([title, r]) => ({title, ...r})),
+            targetConnector: this._targetConnector,
+            targetMonitor: this._chosenMonitor(),
+            desktopMonitor: this._desktopMonitor,
+            monitors: Main.layoutManager.monitors.map((m, index) => ({
+                index,
+                primary: index === Main.layoutManager.primaryIndex,
+                mutterInFullscreen: global.display.get_monitor_in_fullscreen(index),
+                shellInFullscreen: m.inFullscreen,
+            })),
+            panels: Main.uiGroup.get_children()
+                .filter(actor => actor.name === 'panelBox')
+                .map(actor => ({
+                    visible: actor.visible,
+                    mapped: actor.mapped,
+                    x: actor.x, y: actor.y, width: actor.width, height: actor.height,
+                })),
             // Bottom-to-top, the order that decides what covers what.
             stack: stackedBottomToTop(mappedWindows()).map((w, depth) => {
                 const actor = w.get_compositor_private();
@@ -557,12 +878,12 @@ class Helper {
                     title: w.get_title() || '',
                     pid: w.get_pid(),
                     layer: w.get_layer(),
+                    type: w.get_window_type(),
                     above: w.is_above(),
                     fullscreen: w.is_fullscreen(),
                     minimized: w.minimized,
                     hidden: w.is_hidden(),
                     showing: w.showing_on_its_workspace(),
-                    csd: w.is_client_decorated(),
                     focus: w.has_focus(),
                     frame: rect(w.get_frame_rect()),
                     // What Mutter actually has to paint, and whether it paints it.
@@ -644,9 +965,54 @@ class Helper {
                 w.minimize();
     }
 
-    SetSurfaceRole(title, layer, anchors) {
-        this._roles.set(title, {layer, anchors});
+    SetSurfaceRole(title, layer, anchors, keyboard) {
+        this._roles.set(title, {layer, anchors, keyboard});
+        for (const win of this._ourWindows())
+            if (win.get_title() === title)
+                this._applyFocusPolicy(win);
         this._scheduleSync();
+    }
+
+    SetTargetMonitor(connector) {
+        this._targetConnector = connector;
+        for (const win of this._ourWindows())
+            this._moveToTargetMonitor(win);
+        if (this._primaryLent)
+            this._makePrimary(connector || this._primaryOwner);
+    }
+
+    LendPrimaryMonitor() {
+        this._primaryLent = true;
+        this._makePrimary(this._targetConnector);
+    }
+
+    ReclaimPrimaryMonitor() {
+        if (!this._primaryLent)
+            return;
+        this._primaryLent = false;
+        this._makePrimary(this._primaryOwner);
+        this._primaryOwner = '';
+    }
+
+    _makePrimary(connector) {
+        if (!connector)
+            return;
+        callDisplayConfig('GetCurrentState', null,
+            ([serial, monitors, logicalMonitors, properties]) => {
+                const current = primaryConnectorOf(logicalMonitors);
+                const known = logicalMonitors.some(logical =>
+                    logical[5].some(([name]) => name === connector));
+                if (!known || current === connector)
+                    return;
+                if (this._primaryLent && !this._primaryOwner)
+                    this._primaryOwner = current;
+                const config = configWithPrimary(
+                    logicalMonitors, currentModes(monitors), connector);
+                callDisplayConfig('ApplyMonitorsConfig',
+                    new GLib.Variant('(uua(iiduba(ssa{sv}))a{sv})', [
+                        serial, APPLY_TEMPORARILY, config, layoutProperties(properties)]));
+                console.log(`${TAG} primary monitor ${current} → ${connector}`);
+            });
     }
 
     // Qt cannot activate its own window without a Wayland token, and Kasual is
@@ -654,19 +1020,51 @@ class Helper {
     // The call lands before Qt has mapped the window, so it may have to wait.
     ActivateSurface(title) {
         this._pendingFocus = title;
+        this._focusAttempts = 0;
         this._focusPending();
     }
 
     _focusPending() {
         if (!this._pendingFocus)
             return;
+        if (this._tryFocusPending())
+            this._forgetPendingFocus();
+        else
+            this._retryFocusPending();
+    }
+
+    _tryFocusPending() {
         const win = this._ourWindows().find(w => w.get_title() === this._pendingFocus);
         if (!win)
-            return;
-        this._pendingFocus = null;
+            return false;
         win.unminimize();
         win.activate(activationTime());
         this._reassertStacking();
+        return win.has_focus();
+    }
+
+    // Mutter hands out no focus while the surface is still being mapped, so the
+    // first attempt lands too early and the request has to outlive it.
+    _retryFocusPending() {
+        if (this._focusSourceId)
+            return;
+        if (++this._focusAttempts >= FOCUS_ATTEMPTS) {
+            this._forgetPendingFocus();
+            return;
+        }
+        this._focusSourceId = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT, FOCUS_RETRY_MS, () => {
+                this._focusSourceId = 0;
+                this._focusPending();
+                return GLib.SOURCE_REMOVE;
+            });
+    }
+
+    _forgetPendingFocus() {
+        if (this._focusSourceId)
+            GLib.source_remove(this._focusSourceId);
+        this._focusSourceId = 0;
+        this._pendingFocus = null;
     }
 
     // Focus is asked for by name (above): activating every pinned window here
@@ -683,7 +1081,7 @@ class Helper {
     // still-drawn Desktop with no DE flash.
     CedeOverlay(wmClass) {
         if (this._appClass === wmClass) {
-            this._pendingFocus = null;
+            this._forgetPendingFocus();
             this._ceded = true;
             this._sync();
         }
@@ -720,8 +1118,7 @@ class Helper {
     // without moving the cursor — see mutter's handle_idletime_for_event().
     SimulateUserActivity() {
         if (!this._virtualPointer) {
-            const seat = Clutter.get_default_backend().get_default_seat();
-            this._virtualPointer = seat.create_virtual_device(
+            this._virtualPointer = defaultSeat().create_virtual_device(
                 Clutter.InputDeviceType.POINTER_DEVICE);
         }
         this._virtualPointer.notify_relative_motion(Clutter.CURRENT_TIME, 0, 0);
@@ -730,7 +1127,7 @@ class Helper {
     // The class stays registered: an OSD mapped later, over a game, must pin too.
     HideOverlay(wmClass) {
         if (this._appClass === wmClass) {
-            this._pendingFocus = null;
+            this._forgetPendingFocus();
             this._showRequested = false;
             this._ceded = false;
             this._sync();

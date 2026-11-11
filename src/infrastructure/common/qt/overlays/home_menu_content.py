@@ -9,17 +9,19 @@ it appears and feeds it pad events via :meth:`configure` / :meth:`handle_pad`.
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Protocol
 
 import qtawesome as qta
 from PyQt6.QtCore import (
-    Qt, QSize, QPoint, QSignalBlocker, QRunnable, QThreadPool, pyqtSignal,
+    Qt, QSize, QSignalBlocker, QRunnable, QThreadPool, pyqtSignal,
 )
-from PyQt6.QtGui import QPainterPath, QRegion, QCursor
+from PyQt6.QtGui import QPainterPath, QRegion
 from PyQt6.QtWidgets import (
     QWidget, QPushButton, QFrame, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QSlider,
 )
 
+from domain.audio.output import AudioOutputs, active_output_label
 from domain.input.vocabulary import Event
 from domain.catalog.target import Target
 from domain.menu.entry import POWER, RETURN_TO_APP, RETURN_TO_DESKTOP
@@ -30,10 +32,11 @@ from domain.shared.feedback import Cue, Feedback
 from domain.system.actions import HIDE_DESKTOP, VOLUME
 from domain.system.bounded_value import BoundedValue
 from domain.system.brightness import Brightness, BrightnessControl
-from domain.system.hud import HudControl
+from domain.system.hud import HudControl, HudLevel
 from domain.system.power_menu import PowerMenu
 from domain.system.volume import Volume, VolumeControl
 from infrastructure.common.qt.ui import styles
+from infrastructure.common.qt.ui.hover import HoverReporting
 
 logger = logging.getLogger(__name__)
 
@@ -44,35 +47,8 @@ _QUICK_WIDTH = _LIST_WIDTH
 _QUICK_RADIUS = 20
 
 
-def _is_synthetic_enter(widget, event) -> bool:
-    """True if this enterEvent is the synthetic one Qt delivers when a widget maps
-    under a stationary cursor (same global pos as the last leave) rather than a real
-    move — mirrors AppTile, so the panel expanding under a parked pointer doesn't
-    hijack the pre-focused card. Latches the leave position on the widget."""
-    pos = event.globalPosition().toPoint()
-    synthetic = pos == getattr(widget, "_pos_at_leave", None)
-    widget._pos_at_leave = None
-    return synthetic
-
-
-class _RoundedFrame(QFrame):
-    """QFrame that clips its children to a rounded rectangle via setMask (mirrors the
-    border-radius from _quick_row_style) and reports genuine pointer hovers."""
-
-    hovered = pyqtSignal()
-
-    def __init__(self, parent=None) -> None:
-        super().__init__(parent)
-        self._pos_at_leave: QPoint | None = None
-
-    def enterEvent(self, event) -> None:
-        super().enterEvent(event)
-        if not _is_synthetic_enter(self, event):
-            self.hovered.emit()
-
-    def leaveEvent(self, event) -> None:
-        super().leaveEvent(event)
-        self._pos_at_leave = QCursor.pos()
+class _RoundedFrame(HoverReporting, QFrame):
+    """QFrame clipping its children to the _quick_row_style border-radius."""
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -81,36 +57,19 @@ class _RoundedFrame(QFrame):
         self.setMask(QRegion(path.toFillPolygon().toPolygon()))
 
 
-class _MenuCard(QPushButton):
-    """A menu action card that reports genuine pointer hovers (mouse parity with the
-    tile bar). enterEvent is overridden at the class level, since PyQt only
-    dispatches Qt virtual events to class methods; the synthetic-enter guard mirrors
-    AppTile."""
-
-    hovered = pyqtSignal()
-
-    def __init__(self, text: str, parent=None) -> None:
-        super().__init__(text, parent)
-        self._pos_at_leave: QPoint | None = None
-
-    def enterEvent(self, event) -> None:
-        super().enterEvent(event)
-        if not _is_synthetic_enter(self, event):
-            self.hovered.emit()
-
-    def leaveEvent(self, event) -> None:
-        super().leaveEvent(event)
-        self._pos_at_leave = QCursor.pos()
+class _MenuCard(HoverReporting, QPushButton):
+    pass
 
 
-_SLIDER_QSS = """
-    QSlider { background: transparent; }
-    QSlider::groove:horizontal { height: 8px; border-radius: 4px; }
-    QSlider::sub-page:horizontal { background: #88c0d0; border-radius: 4px; }
-    QSlider::add-page:horizontal  { background: #4c566a; border-radius: 4px; }
-    QSlider::handle:horizontal {
+_SLIDER_QSS = f"""
+    QSlider {{ background: transparent; }}
+    QSlider::horizontal {{ min-height: 24px; }}
+    QSlider::groove:horizontal {{ height: 8px; border-radius: 4px; }}
+    QSlider::sub-page:horizontal {{ background: {styles.COLOR_ACCENT}; border-radius: 4px; }}
+    QSlider::add-page:horizontal  {{ background: {styles.COLOR_TRACK}; border-radius: 4px; }}
+    QSlider::handle:horizontal {{
         width: 22px; height: 22px; margin: -7px 0; background: white; border-radius: 11px;
-    }
+    }}
 """
 
 
@@ -120,17 +79,25 @@ def _quick_row_style(selected: bool) -> str:
     return f"background-color: transparent; border: 2px solid transparent; border-radius: {_QUICK_RADIUS}px;"
 
 
-class _Zone:
-    """A rendered section: its kind, the source items, the row/card widgets, the
-    grid width, and the current selection within it."""
+class _SliderRow(Protocol):
+    def adjust(self, sign: int) -> bool: ...
+    def set_from_raw(self, raw: int) -> bool: ...
 
+
+class _Zone:
     def __init__(self, kind: SectionKind, items: list[MenuItem],
-                 widgets: list[QWidget], columns: int = 1) -> None:
+                 widgets: list[QWidget], columns: int = 1,
+                 sliders: "list[_SliderRow] | None" = None) -> None:
         self.kind = kind
         self.items = items
         self.widgets = widgets
         self.columns = columns
+        self.sliders = sliders or []
         self.index = 0
+
+    @property
+    def is_adjustable(self) -> bool:
+        return bool(self.sliders)
 
 
 @dataclass
@@ -158,6 +125,30 @@ class _QuickRow:
         return True
 
 
+@dataclass
+class _HudRow:
+    hud: HudControl
+    level: HudLevel
+    slider: QSlider
+    vlabel: QLabel
+
+    def adjust(self, sign: int) -> bool:
+        return self._commit(self.level.adjusted(sign))
+
+    def set_from_raw(self, raw: int) -> bool:
+        return self._commit(self.level.at(raw))
+
+    def _commit(self, new: HudLevel) -> bool:
+        if new == self.level:
+            return False
+        self.level = new
+        self.hud.set_level(new)
+        with QSignalBlocker(self.slider):
+            self.slider.setValue(new.value)
+        self.vlabel.setText(new.label)
+        return True
+
+
 class HomeMenuContent(QWidget):
     """The sectioned Home menu as an embeddable, surface-less widget.
 
@@ -171,6 +162,7 @@ class HomeMenuContent(QWidget):
     # (build generation, row index, action, fetched value) — the generation
     # guards against a value arriving after the menu has since been rebuilt.
     _value_ready = pyqtSignal(int, int, str, object)
+    _output_name_ready = pyqtSignal(int, object)
 
     def __init__(
         self,
@@ -178,12 +170,18 @@ class HomeMenuContent(QWidget):
         volume: VolumeControl,
         brightness: BrightnessControl,
         power: PowerMenu,
+        audio_outputs: AudioOutputs,
+        gamepad_access_needed: Callable[[], bool] = lambda: False,
     ) -> None:
         super().__init__()
         self._feedback = feedback
         self._volume = volume
+        self._audio_outputs = audio_outputs
+        self._last_output_name: str | None = None
+        self._output_name: QLabel | None = None
         self._brightness = brightness
         self._power = power
+        self._gamepad_access_needed = gamepad_access_needed
 
         self._zones: list[_Zone] = []
         self._active = 0
@@ -194,6 +192,7 @@ class HomeMenuContent(QWidget):
         self._last_values: dict[str, BoundedValue] = {}
         self._build_gen = 0
         self._value_ready.connect(self._on_value_ready)
+        self._output_name_ready.connect(self._on_output_name_ready)
         self._on_action: Callable[[MenuItem], None] | None = None
         self._on_cancel: Callable[[], None] | None = None
         self._set_hints: Callable | None = None
@@ -225,6 +224,7 @@ class HomeMenuContent(QWidget):
         set_hints: Callable | None,
         request_hide: Callable[[], None],
         desktop_minimized: bool = False,
+        foreground_pid: int | None = None,
         header=None,
         on_power_chooser: Callable[[], None] | None = None,
     ) -> None:
@@ -239,14 +239,17 @@ class HomeMenuContent(QWidget):
         self._request_hide = request_hide
         self._header = header
         self._on_power_chooser = on_power_chooser
+        self._hud = hud
         sections = compose_home_sections(
             foreground, hud,
             brightness_controllable=self._brightness.is_controllable(),
             power_default=self._power.default_key(),
             foreground_is_game=foreground_is_game,
+            foreground_pid=foreground_pid,
             # Network / Notifications live on the header when one is present, so
             # don't repeat them in the Actions grid.
             include_status_actions=header is None,
+            gamepad_access_needed=foreground is None and self._gamepad_access_needed(),
         )
         self._build(sections.sections)
         self._focus_default(foreground, desktop_minimized)
@@ -293,54 +296,92 @@ class HomeMenuContent(QWidget):
                 self._zones_layout.addWidget(styles.separator())
             if section.kind == SectionKind.QUICK:
                 self._zones.append(self._build_quick(section))
+            elif section.kind == SectionKind.HUD:
+                self._zones.append(self._build_hud(section))
             else:
                 self._zones.append(self._build_cards(section))
 
     def _build_quick(self, section: HomeSection) -> _Zone:
-        zone_index = len(self._zones)   # the index this zone takes once appended
+        zone_index = len(self._zones)
+        rows: list[QWidget] = []
+        for row_i, item in enumerate(section.items):
+            control = self._control_for(item.action)
+            value = self._last_values.get(item.action) or self._default_value(item.action)
+            slider = self._slider(zone_index, row_i, maximum=100, value=value.value)
+            vlabel = self._value_label(f"{value.value}%")
+            if item.action == VOLUME:
+                middle = self._with_caption_below(slider, self._output_name_caption())
+            else:
+                middle = slider
+            rows.append(self._slider_row(zone_index, row_i, item.icon, middle, vlabel))
+            self._quick_state.append(_QuickRow(control, value, slider, vlabel))
+            self._fetch_value_async(item.action, control, len(self._quick_state) - 1)
+        self._add_slider_rows(rows)
+        return _Zone(SectionKind.QUICK, section.items, rows, sliders=self._quick_state)
+
+    def _build_hud(self, section: HomeSection) -> _Zone:
+        zone_index = len(self._zones)
+        item = section.items[0]
+        level = self._hud.level()
+        slider = self._slider(zone_index, 0, maximum=level.most_detailed, value=level.value)
+        vlabel = self._value_label(level.label)
+        caption = self._caption(item.label)
+        row = self._slider_row(zone_index, 0, item.icon,
+                               self._with_caption_below(slider, caption), vlabel)
+        self._add_slider_rows([row])
+        return _Zone(SectionKind.HUD, section.items, [row],
+                     sliders=[_HudRow(self._hud, level, slider, vlabel)])
+
+    def _slider(self, zone_index: int, row_i: int, *, maximum: int, value: int) -> QSlider:
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(0, maximum)
+        slider.setPageStep(1)
+        slider.setValue(value)
+        slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        slider.setStyleSheet(_SLIDER_QSS)
+        slider.valueChanged.connect(
+            lambda raw, zi=zone_index, ci=row_i: self._on_slider(zi, ci, raw))
+        return slider
+
+    @staticmethod
+    def _value_label(text: str) -> QLabel:
+        vlabel = QLabel(text)
+        vlabel.setFixedWidth(52)
+        vlabel.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        vlabel.setStyleSheet("color: white; font-size: 18px; background: transparent;")
+        return vlabel
+
+    def _slider_row(self, zone_index: int, row_i: int, icon_name: str,
+                    middle: QWidget | QVBoxLayout, vlabel: QLabel) -> _RoundedFrame:
+        row = _RoundedFrame()
+        row.setFrameShape(QFrame.Shape.NoFrame)
+        row.setStyleSheet(_quick_row_style(False))
+        row.hovered.connect(lambda zi=zone_index, ci=row_i: self._hover_item(zi, ci))
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(12, 8, 12, 8)
+        rl.setSpacing(12)
+        icon = QLabel()
+        icon.setPixmap(qta.icon(icon_name, color="white").pixmap(24, 24))
+        icon.setStyleSheet("background: transparent;")
+        rl.addWidget(icon)
+        if isinstance(middle, QVBoxLayout):
+            rl.addLayout(middle, 1)
+        else:
+            rl.addWidget(middle, 1)
+        rl.addWidget(vlabel)
+        return row
+
+    def _add_slider_rows(self, rows: list[QWidget]) -> None:
         container = QWidget()
         container.setStyleSheet("background: transparent;")
         col = QVBoxLayout(container)
         col.setContentsMargins(0, 0, 0, 0)
         col.setSpacing(18)
-        rows: list[QWidget] = []
-        for row_i, item in enumerate(section.items):
-            control = self._control_for(item.action)
-            value = self._last_values.get(item.action) or self._default_value(item.action)
-            row = _RoundedFrame()
-            row.setFrameShape(QFrame.Shape.NoFrame)
-            row.setStyleSheet(_quick_row_style(False))
-            row.hovered.connect(lambda zi=zone_index, ci=row_i: self._hover_item(zi, ci))
-            rl = QHBoxLayout(row)
-            rl.setContentsMargins(12, 8, 12, 8)
-            rl.setSpacing(12)
-            icon = QLabel()
-            icon.setPixmap(qta.icon(item.icon, color="white").pixmap(24, 24))
-            icon.setStyleSheet("background: transparent;")
-            rl.addWidget(icon)
-            slider = QSlider(Qt.Orientation.Horizontal)
-            slider.setRange(0, 100)
-            slider.setValue(value.value)
-            slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            slider.setStyleSheet(_SLIDER_QSS)
-            slider.valueChanged.connect(
-                lambda raw, zi=zone_index, ci=row_i: self._on_slider(zi, ci, raw))
-            rl.addWidget(slider, 1)
-            vlabel = QLabel(f"{value.value}%")
-            vlabel.setFixedWidth(52)
-            vlabel.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            vlabel.setStyleSheet("color: white; font-size: 18px; background: transparent;")
-            rl.addWidget(vlabel)
+        for row in rows:
             col.addWidget(row)
-            rows.append(row)
-            self._quick_state.append(
-                _QuickRow(control, value, slider, vlabel))
-            self._fetch_value_async(item.action, control, len(self._quick_state) - 1)
-        # Fixed, not max: under AlignHCenter a mere maximum collapses to the
-        # slider's tiny size hint.
+        # A maximum width collapses to the slider's size hint under AlignHCenter.
         container.setFixedWidth(_QUICK_WIDTH)
         self._zones_layout.addWidget(container, alignment=Qt.AlignmentFlag.AlignHCenter)
-        return _Zone(SectionKind.QUICK, section.items, rows)
 
     def _build_cards(self, section: HomeSection) -> _Zone:
         zone_index = len(self._zones)
@@ -366,6 +407,45 @@ class HomeMenuContent(QWidget):
         container.setFixedWidth(_LIST_WIDTH)
         self._zones_layout.addWidget(container, alignment=Qt.AlignmentFlag.AlignHCenter)
         return _Zone(section.kind, section.items, cards, columns=1)
+
+    @staticmethod
+    def _with_caption_below(slider: QSlider, caption: QLabel) -> QVBoxLayout:
+        column = QVBoxLayout()
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(2)
+        column.addWidget(slider)
+        column.addWidget(caption)
+        return column
+
+    @staticmethod
+    def _caption(text: str = "") -> QLabel:
+        caption = QLabel(text)
+        caption.setStyleSheet("color: #9aa0aa; font-size: 14px; background: transparent;")
+        return caption
+
+    def _output_name_caption(self) -> QLabel:
+        self._output_name = self._caption()
+        self._show_output_name(self._last_output_name)
+        self._fetch_output_name_async()
+        return self._output_name
+
+    def _fetch_output_name_async(self) -> None:
+        gen = self._build_gen
+
+        def work() -> None:
+            self._output_name_ready.emit(gen, active_output_label(self._audio_outputs))
+
+        QThreadPool.globalInstance().start(QRunnable.create(work))
+
+    def _on_output_name_ready(self, gen: int, name: str | None) -> None:
+        if gen != self._build_gen or self._output_name is None:
+            return
+        self._last_output_name = name
+        self._show_output_name(name)
+
+    def _show_output_name(self, name: str | None) -> None:
+        self._output_name.setText(name or "")
+        self._output_name.setVisible(name is not None)
 
     def _control_for(self, action: str):
         return self._volume if action == VOLUME else self._brightness
@@ -407,18 +487,16 @@ class HomeMenuContent(QWidget):
         else:
             key = RETURN_TO_DESKTOP
         for zi, zone in enumerate(self._zones):
-            if zone.kind in (SectionKind.QUICK, SectionKind.HEADER):
+            if zone.is_adjustable or zone.kind == SectionKind.HEADER:
                 continue
             for ci, item in enumerate(zone.items):
                 if item.action == key:
                     self._active = zi
                     zone.index = ci
                     return
-        # Fall back to the first non-chrome zone (never open focused on the header
-        # or a slider) — the Actions zone in every composed context.
         self._active = next(
             (zi for zi, z in enumerate(self._zones)
-             if z.kind not in (SectionKind.QUICK, SectionKind.HEADER)),
+             if not z.is_adjustable and z.kind != SectionKind.HEADER),
             0,
         )
 
@@ -454,8 +532,8 @@ class HomeMenuContent(QWidget):
             return
         if zone is None:
             return
-        if zone.kind == SectionKind.QUICK:
-            self._quick_event(zone, event)
+        if zone.is_adjustable:
+            self._slider_event(zone, event)
         else:
             self._cards_event(zone, event)
 
@@ -489,7 +567,7 @@ class HomeMenuContent(QWidget):
         self.sync_hints()
         self._feedback.play(Cue.CURSOR)
 
-    def _quick_event(self, zone: _Zone, event: str) -> None:
+    def _slider_event(self, zone: _Zone, event: str) -> None:
         if event == Event.UP:
             if zone.index == 0:
                 self._cross_to_zone(-1, landing="last")
@@ -501,9 +579,9 @@ class HomeMenuContent(QWidget):
             else:
                 self._move_within(zone, +1)
         elif event == Event.LEFT:
-            self._adjust(zone.index, -1)
+            self._adjust(zone.sliders[zone.index], -1)
         elif event == Event.RIGHT:
-            self._adjust(zone.index, +1)
+            self._adjust(zone.sliders[zone.index], +1)
 
     def _cards_event(self, zone: _Zone, event: str) -> None:
         n = len(zone.items)
@@ -546,8 +624,8 @@ class HomeMenuContent(QWidget):
             self.sync_hints()
             self._feedback.play(Cue.CURSOR)
 
-    def _adjust(self, slider_index: int, sign: int) -> None:
-        if self._quick_state[slider_index].adjust(sign):
+    def _adjust(self, slider: _SliderRow, sign: int) -> None:
+        if slider.adjust(sign):
             self._feedback.play(Cue.CURSOR)
 
     def _nudge_volume(self, sign: int) -> None:
@@ -616,7 +694,7 @@ class HomeMenuContent(QWidget):
         runs for genuine drags; the row snaps the handle to any domain re-clamp."""
         self._active = zone_i
         self._zones[zone_i].index = item_i
-        self._quick_state[item_i].set_from_raw(raw)
+        self._zones[zone_i].sliders[item_i].set_from_raw(raw)
         self._render()
         self.sync_hints()
 
@@ -669,7 +747,7 @@ class HomeMenuContent(QWidget):
                 continue
             for wi, widget in enumerate(zone.widgets):
                 selected = active and wi == zone.index
-                if zone.kind == SectionKind.QUICK:
+                if zone.is_adjustable:
                     widget.setStyleSheet(_quick_row_style(selected))
                 else:
                     widget.setStyleSheet(
@@ -681,7 +759,7 @@ class HomeMenuContent(QWidget):
         if self._set_hints is None or not self._zones:
             return
         zone = self._zones[self._active]
-        if zone.kind == SectionKind.QUICK:
+        if zone.is_adjustable:
             hints = nav_hints.OVERLAY_QUICK
         elif zone.kind == SectionKind.HEADER:
             # The header row navigates left/right; Y/Options only applies to

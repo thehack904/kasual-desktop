@@ -6,7 +6,7 @@ factory, the session collaborators) — no `infrastructure.*` imports.
 
 import logging
 
-from domain.menu.entry import CLOSE_APP, RETURN_TO_APP, RETURN_TO_DESKTOP, TOGGLE_HUD
+from domain.menu.entry import CLOSE_APP, RETURN_TO_APP, RETURN_TO_DESKTOP
 from domain.menu.item import MenuItem
 from domain.shared.event_emitter import Unsubscribe
 from domain.input.gamepad_signals import GamepadSignals
@@ -15,10 +15,10 @@ from domain.lifecycle.window_manager import WindowManager
 from domain.shell.desktop_control import DesktopControl
 from domain.shell.overlay import SectionedHomeOverlay, SectionedOverlayFactory
 from domain.shell.session import SessionPolicy
-from domain.shell.session_collaborators import ConnectionIndicator
+from domain.shell.session_collaborators import ConnectionIndicator, SessionSound
 from domain.system.actions import ActionDeps
 from domain.system.action_view import make_action_confirm
-from domain.system.hud import HudControl, toggle_hud
+from domain.system.hud import HudControl
 from domain.system.runner import ActionRunner
 
 logger = logging.getLogger(__name__)
@@ -40,6 +40,7 @@ class Application:
         wm:              WindowManager,
         overlay_factory: SectionedOverlayFactory,
         hud:             HudControl,
+        sound:           SessionSound,
     ) -> None:
         self._desktop         = desktop
         self._app_control     = app_control
@@ -51,7 +52,7 @@ class Application:
         # SectionedHomeOverlay that composes its own zones; the controller hands it
         # only the foreground context plus the dispatch/cancel/hint callbacks.
         self._overlay: SectionedHomeOverlay | None = None
-        self._session         = SessionPolicy(view=desktop, indicator=tray)
+        self._session         = SessionPolicy(view=desktop, indicator=tray, sound=sound)
         # System actions (sleep/shutdown/…) run through the domain ActionRunner,
         # gating the confirmable ones on the Desktop's tracked confirm dialog.
         self._action_runner = ActionRunner(
@@ -120,6 +121,7 @@ class Application:
             on_cancel=on_cancel,
             set_hints=self._desktop.set_overlay_hints,
             desktop_minimized=not self._desktop.is_visible(),
+            foreground_pid=self._app_control.foreground_game_pid(),
         )
         # Swap the standalone hint bar to the overlay-menu controls (and keep it
         # on screen even over a running app). The bar is its own surface, so it
@@ -136,10 +138,6 @@ class Application:
             self._app_control.restore_app(item.target)
         elif item.action == CLOSE_APP:
             self._app_control.request_close_app(item.target)
-        elif item.action == TOGGLE_HUD:
-            # The overlay merely floats over the live app, so flipping the HUD
-            # and closing reveals the same app with its HUD changed.
-            toggle_hud(self._hud)
         elif item.action == RETURN_TO_DESKTOP:
             # From a running app we leave it (minimize + raise KD); on the bare
             # Desktop we just bring KD to the front.

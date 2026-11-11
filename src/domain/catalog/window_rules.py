@@ -59,24 +59,19 @@ def is_app_running(
     return any(w.matches_app(app) for w in windows)
 
 
-def active_unmanaged_window(
-    windows: Sequence[Window],
-    apps:    Sequence[App],
-) -> Window | None:
-    """The active window that belongs to no configured app — e.g. a game running
-    in its own window under a launcher, so the Home Overlay names and returns to
-    the game, not the launcher. Identity-based, since a Steam game's process
-    session isn't reliably attributable but never matches the ``steam`` tile.
+def app_window(windows: Sequence[Window], app: App) -> Window | None:
+    own = [w for w in windows if w.pid and w.matches_app(app)]
+    if not own:
+        return None
+    return next((w for w in own if w.holds_screen), own[0])
 
-    It has to hold the screen. Focus alone would adopt whatever happens to be in
-    front — a terminal the user clicked into — and the Home Overlay would then offer
-    to close *that*."""
+
+def active_window_not_owned_by(windows: Sequence[Window],
+                               foreground: App) -> Window | None:
     active = next((w for w in windows if w.active and w.pid), None)
-    if active is None or not (active.fullscreen or active.covers_screen):
+    if active is None or not active.holds_screen:
         return None
-    if any(active.matches_app(app) for app in apps):
-        return None
-    return active
+    return None if active.matches_app(foreground) else active
 
 
 def walk_parent_chain(

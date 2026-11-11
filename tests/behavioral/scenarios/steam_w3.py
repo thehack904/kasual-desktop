@@ -27,6 +27,7 @@ STEAM_TILE = 'steam'          # the KD tile, whose .desktop opens steam://open/b
 GAME = 'The Witcher 3: Wild Hunt'   # for the report only; the tile is found by APPID
 APPID = '292030'
 LAUNCHER = 'RED Launcher'
+_LAUNCHER_TAKES_FOCUS_S = 2
 
 
 def _body(session: Session) -> None:
@@ -49,17 +50,18 @@ def _body(session: Session) -> None:
     steam_ui.open_game_page(steam, session.pad, GAME)
     steam_ui.press_play(session.pad)
 
-    if game.wait_plain_window(LAUNCHER) is None:
+    launcher = game.wait_plain_window(LAUNCHER)
+    if launcher is None:
         raise ScenarioAborted(f'the {LAUNCHER} never mapped')
     shell.note_kd_state(session.kd, LAUNCHER)
 
-    time.sleep(2)   # let the launcher take focus before it is driven
-    game.activate_launcher(LAUNCHER)
+    time.sleep(_LAUNCHER_TAKES_FOCUS_S)
+    game.activate_launcher(LAUNCHER, launcher)
 
     window = game.wait_fullscreen()
     game.check_process(window)
     shell.check_kd_ceded(session.kd)
-    shell.check_home_menu_over_game(session.kd, session.pad)
+    shell.check_home_menu_over_game(session.kd, session.pad, game)
 
 
 SCENARIO = Scenario(
@@ -70,6 +72,7 @@ SCENARIO = Scenario(
     requires=(
         require.window_source(),
         require.command('steam'),
+        require.steam_devtools_client(),
         require.not_running(
             'steam',
             'Steam is not running (the run starts it, and only a Steam started '

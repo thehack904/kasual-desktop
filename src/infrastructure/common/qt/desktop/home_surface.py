@@ -23,24 +23,28 @@ import logging
 from collections.abc import Callable
 
 from PyQt6.QtCore import (
-    Qt, QTimer, QPropertyAnimation, QParallelAnimationGroup, QEasingCurve, pyqtSignal,
+    Qt, QEvent, QRect, QTimer, QPropertyAnimation, QParallelAnimationGroup,
+    QEasingCurve, pyqtSignal,
 )
-from PyQt6.QtGui import QGuiApplication, QPainter, QRegion
+from PyQt6.QtGui import QPainter, QRegion
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QGraphicsOpacityEffect
 
+from domain.audio.output import AudioOutputs
 from domain.catalog.target import Target
 from domain.input.pad_control import PadControl
 from domain.menu.item import MenuItem
 from domain.shared.event_emitter import Unsubscribe
 from domain.shared.feedback import Cue, Feedback
 from domain.system.brightness import BrightnessControl
-from domain.system.hud import HudControl
+from domain.system.hud import HUD_OFF, HudControl, HudLevel
 from domain.system.power_menu import PowerMenu
 from domain.system.volume import VolumeControl
 from infrastructure.common.qt.ui import styles
-from infrastructure.common.qt.ui.deferred_unmap import DeferredUnmap
+from infrastructure.common.qt.ui.surface_hiding import SurfaceHiding
+from infrastructure.common.qt.ui.target_screen import narrower_than_target_screen, target_screen
 from infrastructure.common.qt.ui.layer_shell import Anchor, Keyboard, Layer
 from infrastructure.common.qt.ui.top_surface import (
+    GNOME_PANEL_CLEARANCE, home_chrome_edge_margin,
     promote_overlay_surface, surface_sized_by_compositor,
 )
 from infrastructure.common.qt.overlays.home_header import HEADER_H, HomeHeader
@@ -48,17 +52,16 @@ from infrastructure.common.qt.overlays.home_menu_content import CARD_WIDTH, Home
 
 logger = logging.getLogger(__name__)
 
-# Clears the tallest DE panel we cannot stack under (GNOME's 29px top bar is
-# painted above every window).
-TOP_MARGIN  = 32
 # Caps the expanded panel; sized for the busiest context (a game with both a
-# brightness slider and the HUD toggle, ~526px) — tighter clips row content.
+# brightness slider and the HUD slider, ~526px) — tighter clips row content.
 CONTENT_H   = 550
 MORPH_MS    = 180   # collapse↔expand animation duration
 # The surface is ALWAYS this tall (sized for the expanded state) and anchored to
 # the top: collapse/expand only morphs the inner content, never the surface — so
-# KWin never sees a resize/remap to animate.
-SURFACE_H   = TOP_MARGIN + HEADER_H + CONTENT_H + TOP_MARGIN
+# KWin never sees a resize/remap to animate. Budgeted with the panel clearance so
+# it never clips whatever the actual top gap turns out to be.
+SURFACE_H   = GNOME_PANEL_CLEARANCE + HEADER_H + CONTENT_H + GNOME_PANEL_CLEARANCE
+_ANCHORS    = Anchor.TOP | Anchor.LEFT | Anchor.RIGHT
 
 
 class _NullHud(HudControl):
@@ -68,9 +71,8 @@ class _NullHud(HudControl):
     type-satisfying placeholder for the embedded content."""
 
     def is_available(self) -> bool: return False
-    def is_enabled(self) -> bool: return False
-    def enable(self) -> None: ...
-    def disable(self) -> None: ...
+    def level(self) -> HudLevel: return HudLevel(HUD_OFF, HUD_OFF)
+    def set_level(self, level: HudLevel) -> None: ...
 
 
 class HomeSurface(QWidget):
@@ -86,6 +88,7 @@ class HomeSurface(QWidget):
         volume: VolumeControl,
         brightness: BrightnessControl,
         power: PowerMenu,
+        audio_outputs: AudioOutputs,
         header: HomeHeader,
         *,
         on_action: Callable[[MenuItem], None],
@@ -93,6 +96,7 @@ class HomeSurface(QWidget):
         begin_hints: Callable[[], None],
         set_hints: Callable,
         end_hints: Callable[[], None],
+        gamepad_access_needed: Callable[[], bool] = lambda: False,
     ) -> None:
         super().__init__()
         self._gamepad = gamepad
@@ -113,11 +117,11 @@ class HomeSurface(QWidget):
         # Mouse input is scoped by mask, not WA_TransparentForMouseEvents (which
         # would empty the Wayland input region entirely) — see _refresh_input_region.
         self._input_open_hold = False
-        self._deferred_unmap = DeferredUnmap(self)
+        self._hiding = SurfaceHiding(self, _ANCHORS)
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(16, TOP_MARGIN, 16, TOP_MARGIN)
-        outer.setSpacing(12)
+        outer.setContentsMargins(16, home_chrome_edge_margin(), 16, GNOME_PANEL_CLEARANCE)
+        outer.setSpacing(0)   # the panel sits flush on the header's bottom edge
         outer.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
 
         # The header is created early by the Desktop (it doubles as the
@@ -125,18 +129,16 @@ class HomeSurface(QWidget):
         self._header = header
         outer.addWidget(self._header, alignment=Qt.AlignmentFlag.AlignHCenter)
 
-        # The expanded Home menu, embedded under the header inside a fixed-width
-        # card. Its max-height + opacity are animated for the morph; collapsed it
-        # is fully shrunk and transparent (but still mapped — no unmap).
-        self._panel = styles.make_card(CARD_WIDTH)
-        # transparency test: 20% — overrides make_card's opaque #2e3440 for the
-        # Home overlay menu only (make_card is shared by the other dialogs).
-        self._panel.setStyleSheet(
-            "background-color: rgba(46, 52, 64, 204); border-radius: 40px;"
-        )
+        # The expanded Home menu: the lower half of the header's pill.
+        self._panel = QWidget()
+        self._panel.setFixedWidth(CARD_WIDTH)
+        # Only ever on screen docked under the header, so its top edge is a seam.
+        self._panel.setStyleSheet(styles.pill_background(top=0))
+        self._panel.installEventFilter(self)   # its height drives the grab handle
         panel_col = QVBoxLayout(self._panel)
         panel_col.setContentsMargins(28, 22, 28, 22)
-        self._content = HomeMenuContent(feedback, volume, brightness, power)
+        self._content = HomeMenuContent(
+            feedback, volume, brightness, power, audio_outputs, gamepad_access_needed)
         panel_col.addWidget(self._content)
         outer.addWidget(self._panel, alignment=Qt.AlignmentFlag.AlignHCenter)
         outer.addStretch(1)
@@ -193,6 +195,19 @@ class HomeSurface(QWidget):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._refresh_input_region()
+        self._keep_handle_on_the_pill()
+        if narrower_than_target_screen(self):
+            QTimer.singleShot(0, self.position_at_top)
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self._panel and event.type() == QEvent.Type.Resize:
+            self._keep_handle_on_the_pill()
+        return super().eventFilter(obj, event)
+
+    def _keep_handle_on_the_pill(self) -> None:
+        handle = self._header.grab_handle()
+        if handle.parentWidget() is self:
+            handle.pin_to(self._pill_bottom())
 
     def _refresh_input_region(self) -> None:
         """Scope the pointer input region to the interactive area: header-only
@@ -204,7 +219,7 @@ class HomeSurface(QWidget):
         if self.is_open() or self._input_open_hold:
             self.clearMask()
         else:
-            self.setMask(QRegion(self._header.geometry()))
+            self.setMask(QRegion(self._pill_rect()))
 
     def hold_input_open(self, hold: bool) -> None:
         """Keep the full input region while a child popover (the Power chooser)
@@ -220,8 +235,7 @@ class HomeSurface(QWidget):
         super().mousePressEvent(event)
 
     def _point_in_menu(self, pos) -> bool:
-        return (self._header.geometry().contains(pos)
-                or self._panel.geometry().contains(pos))
+        return self._pill_rect().contains(pos)
 
     # ── Header mouse while expanded (the header is the menu's zone 0) ────────
 
@@ -243,27 +257,31 @@ class HomeSurface(QWidget):
         promote_overlay_surface(
             self,
             layer=Layer.OVERLAY,
-            anchors=Anchor.TOP | Anchor.LEFT | Anchor.RIGHT,
+            anchors=_ANCHORS,
             exclusive_zone=0,
             keyboard=Keyboard.NONE,
         )
 
     def position_at_top(self) -> None:
-        """Size the surface to the top strip of the primary screen. Skipped where
+        """Size the surface to the top strip of the target screen. Skipped where
         layer-shell anchors already do it; on GNOME the position is ignored (Mutter
         places top-levels) but the width must be ours, set before the first map."""
         if surface_sized_by_compositor():
             return
-        screen = QGuiApplication.primaryScreen()
+        screen = target_screen()
         if screen is not None:
             g = screen.geometry()
+            self.setFixedWidth(g.width())
             self.setGeometry(g.x(), g.y(), g.width(), SURFACE_H)
 
     def hide(self) -> None:
-        self._deferred_unmap.hide()
+        self._hiding.hide()
+
+    def is_on_screen(self) -> bool:
+        return self.isVisible() and not self._hiding.is_hidden
 
     def show_collapsed(self) -> None:
-        self._deferred_unmap.cancel()
+        self._hiding.unhide()
         self.position_at_top()
         self.show()
         self.raise_()
@@ -276,7 +294,7 @@ class HomeSurface(QWidget):
         if self._expanded:
             return
         self._expanded = True
-        self._header.set_menu_open(True)
+        self._fuse_with_panel(True)
         self._content.configure(
             foreground=None, foreground_is_game=False, hud=_NullHud(),
             on_action=self._on_action, on_cancel=None,
@@ -308,13 +326,10 @@ class HomeSurface(QWidget):
         if not self._expanded:
             return
         self._expanded = False
-        self._header.set_menu_open(False)
         self._teardown_menu()
         self._morph(open_=False)
         self._end_hints()
-        # Narrow back to the header only *after* the panel has morphed away — the
-        # mask clips painting, so shrinking it early would snap the closing panel.
-        QTimer.singleShot(MORPH_MS, self._refresh_input_region)
+        QTimer.singleShot(MORPH_MS, self._settle_collapsed)
 
     def collapse_immediately(self) -> None:
         """Snap to the collapsed visuals with no animation and drop the menu if it
@@ -325,7 +340,7 @@ class HomeSurface(QWidget):
             self._teardown_menu()
             self._expanded = False
             self._on_demand = False
-            self._header.set_menu_open(False)
+        self._fuse_with_panel(False)
         self._anim.stop()
         self._panel.setMaximumHeight(0)
         self._opacity.setOpacity(0.0)
@@ -362,6 +377,7 @@ class HomeSurface(QWidget):
         on_cancel: Callable[[], None] | None,
         set_hints: Callable | None,
         desktop_minimized: bool = False,
+        foreground_pid: int | None = None,
     ) -> None:
         """Map the surface straight to the expanded layout over an app / minimized
         Kasual. The controller wires the dispatch (its ``on_action`` handles app
@@ -369,14 +385,15 @@ class HomeSurface(QWidget):
         if self.is_open():
             return
         self._on_demand = True
-        self._header.set_menu_open(True)
+        self._fuse_with_panel(True)
         self._content.configure(
             foreground, foreground_is_game, hud,
             on_action=on_action, on_cancel=on_cancel, set_hints=set_hints,
             request_hide=self.dismiss, desktop_minimized=desktop_minimized,
+            foreground_pid=foreground_pid,
             header=self._header, on_power_chooser=self._on_power_chooser,
         )
-        self._deferred_unmap.cancel()
+        self._hiding.unhide()
         self.position_at_top()
         self.show()
         self.raise_()
@@ -394,7 +411,7 @@ class HomeSurface(QWidget):
         if not self._on_demand:
             return
         self._on_demand = False
-        self._header.set_menu_open(False)
+        self._fuse_with_panel(False)
         self._teardown_menu()
         self._anim.stop()
         self._panel.setMaximumHeight(0)
@@ -424,6 +441,34 @@ class HomeSurface(QWidget):
         """Re-push the menu's own hint set — used after a chooser popover that
         floated over the open menu closes."""
         self._content.sync_hints()
+
+    def _settle_collapsed(self) -> None:
+        """Waits out the closing morph: the handle rides the panel down to its last
+        frame, and the mask clips painting, so narrowing it early snaps that panel
+        away mid-animation."""
+        if self.is_open():   # reopened inside the morph
+            return
+        self._fuse_with_panel(False)
+        self._refresh_input_region()
+
+    def _fuse_with_panel(self, fused: bool) -> None:
+        self._header.set_docked(fused)
+        handle = self._header.grab_handle()
+        host = self if fused else self._header
+        if handle.parentWidget() is not host:
+            handle.setParent(host)
+            handle.show()   # setParent() hides it
+            handle.raise_()
+        handle.pin_to(self._pill_bottom() if fused else self._header.height())
+
+    def _pill_rect(self) -> QRect:
+        """Header and panel share a width and an edge, so their bounding box is the
+        pill exactly — mid-morph too."""
+        rect = self._header.geometry()
+        return rect.united(self._panel.geometry()) if self._panel.isVisible() else rect
+
+    def _pill_bottom(self) -> int:
+        return self._pill_rect().bottom() + 1   # QRect.bottom() is the last row
 
     def _teardown_menu(self) -> None:
         self._gamepad.pop_handler(self._content.handle_pad)

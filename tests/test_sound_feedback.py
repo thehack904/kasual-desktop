@@ -1,7 +1,13 @@
-"""Tests for pure helper functions in audio/feedback.py (SoundFeedback backend)."""
+"""Tests for audio/feedback.py (SoundFeedback backend)."""
 
 import struct
 
+import pytest
+
+from PyQt6.QtMultimedia import QAudio
+
+from domain.shared.feedback import Cue
+from infrastructure.common.audio import feedback
 from infrastructure.common.audio.feedback import _convert_24_to_16
 
 
@@ -42,3 +48,127 @@ class TestConvert24To16:
 
     def test_empty_input(self):
         assert _convert_24_to_16(b"") == b""
+
+
+class FakeSignal:
+    def __init__(self):
+        self.handlers = []
+
+    def connect(self, handler):
+        self.handlers.append(handler)
+
+    def emit(self, state):
+        for handler in self.handlers:
+            handler(state)
+
+
+class FakeSink:
+    instances: list['FakeSink'] = []
+
+    def __init__(self, _fmt):
+        self.buffer_size = None
+        self.started_bytes = None
+        self.stopped = False
+        self.unplayed_discarded = False
+        self.stateChanged = FakeSignal()
+        FakeSink.instances.append(self)
+
+    def setBufferSize(self, size):
+        self.buffer_size = size
+
+    def start(self, device):
+        self.started_bytes = device.size()
+
+    def stop(self):
+        self.stopped = True
+
+    def reset(self):
+        self.unplayed_discarded = True
+
+
+class TestPlay:
+    @pytest.fixture(autouse=True)
+    def silence_sounds(self):
+        # Overrides conftest's autouse patch of play(), the method under test.
+        yield
+
+    @pytest.fixture
+    def sound(self, monkeypatch):
+        FakeSink.instances = []
+        monkeypatch.setattr(feedback, 'QAudioSink', FakeSink)
+        played = feedback.SoundFeedback()
+        played.init()
+        return played
+
+    def test_the_sink_is_sized_to_hold_the_whole_cue(self, sound):
+        sound.play(Cue.CURSOR)
+
+        sink, = FakeSink.instances
+        assert sink.started_bytes > 0
+        assert sink.buffer_size == sink.started_bytes
+
+    def test_a_cue_that_played_out_releases_its_stream(self, sound):
+        sound.play(Cue.CURSOR)
+        sink, = FakeSink.instances
+
+        sink.stateChanged.emit(QAudio.State.IdleState)
+
+        assert sink.stopped
+
+    def test_a_cue_still_playing_keeps_its_stream(self, sound):
+        sound.play(Cue.CURSOR)
+        sink, = FakeSink.instances
+
+        sink.stateChanged.emit(QAudio.State.ActiveState)
+
+        assert not sink.stopped
+
+
+class TestSilence:
+    @pytest.fixture(autouse=True)
+    def silence_sounds(self):
+        yield
+
+    @pytest.fixture
+    def sound(self, monkeypatch, qapp):
+        FakeSink.instances = []
+        monkeypatch.setattr(feedback, 'QAudioSink', FakeSink)
+        played = feedback.SoundFeedback()
+        played.init()
+        return played
+
+    def test_stops_every_playing_cue(self, sound):
+        sound.play(Cue.CURSOR)
+        sound.play(Cue.SELECT)
+
+        sound.silence()
+
+        assert all(sink.stopped for sink in FakeSink.instances)
+
+    def test_discards_the_unplayed_rest_instead_of_draining_it(self, sound):
+        sound.play(Cue.SELECT)
+
+        sound.silence()
+
+        sink, = FakeSink.instances
+        assert sink.unplayed_discarded
+
+    def test_releases_the_silenced_streams(self, sound, qapp):
+        sound.play(Cue.CURSOR)
+
+        sound.silence()
+        qapp.processEvents()
+
+        assert sound._active == []
+
+    def test_a_cue_after_silencing_still_plays(self, sound, qapp):
+        sound.play(Cue.CURSOR)
+        sound.silence()
+        qapp.processEvents()
+
+        sound.play(Cue.SELECT)
+
+        later = FakeSink.instances[-1]
+        assert later.started_bytes > 0
+        assert not later.stopped
+        assert [sink for sink, _ in sound._active] == [later]

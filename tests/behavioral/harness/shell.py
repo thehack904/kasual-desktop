@@ -8,12 +8,16 @@ appear in KWin's stacking order.
 from __future__ import annotations
 
 import time
+from typing import TYPE_CHECKING
 
 from tests.behavioral.harness import timeouts
 from tests.behavioral.harness.kd_client import KasualDesktopUnavailable, KDClient
 from tests.behavioral.harness.navigation import focus_tile
 from tests.behavioral.harness.report import ScenarioAborted, report
 from tests.behavioral.harness.virtual_pad import VirtualPad
+
+if TYPE_CHECKING:
+    from tests.behavioral.harness.game import SteamGame
 
 
 # ── bring-up ─────────────────────────────────────────────────────────────────
@@ -44,6 +48,13 @@ def launch_tile(kd: KDClient, pad: VirtualPad, tile_id: str) -> None:
            f'{tile_id} at index {snapshot["focus"]["tile_index"]}')
     pad.confirm()
     report('A pressed on the tile', 'PASS', 'KD launches the app')
+
+
+def restore_tile(kd: KDClient, pad: VirtualPad, tile_id: str) -> None:
+    focus_tile(kd, pad, tile_id)
+    pad.confirm()
+    report('A pressed on the running tile', 'PASS', 'KD restores the app')
+    expect_foreground(kd, kd.tile_name(tile_id))
 
 
 # ── where KD is ──────────────────────────────────────────────────────────────
@@ -124,7 +135,8 @@ def expect_foreground(kd: KDClient, app: str) -> None:
     report('KD has the launched app in front', 'PASS', repr(app))
 
 
-def check_home_menu_over_game(kd: KDClient, pad: VirtualPad) -> None:
+def check_home_menu_over_game(kd: KDClient, pad: VirtualPad,
+                              game: SteamGame) -> None:
     time.sleep(5)   # let the engine settle past the launcher
     pad.hold_home(1.2)
     try:
@@ -136,20 +148,22 @@ def check_home_menu_over_game(kd: KDClient, pad: VirtualPad) -> None:
                'Home held for 1.2 s, menu never opened')
         return
     report('Home Menu above the game', 'PASS', 'overlay-layer surface mapped')
+    game.check_still_on_screen('Home menu')
 
 
 # ── the Home menu ────────────────────────────────────────────────────────────
 
 # The action keys KD reports for its menu cards.
+GAMEPAD_ACCESS    = 'gamepad_access'
 HIDE_DESKTOP      = 'hide_desktop'
 RETURN_TO_DESKTOP = 'return_to_desktop'
 RETURN_TO_APP     = 'return_to_app'
 CLOSE_APP         = 'close_app'
-TOGGLE_HUD        = 'toggle_hud'
+HUD_LEVEL         = 'hud_level'
 
 QUICK   = 'quick'     # the sliders
 ACTIONS = 'actions'   # the cards
-HUD     = 'hud'       # the performance-HUD toggle, offered over a game and nowhere else
+HUD     = 'hud'       # the performance-HUD level slider, offered over a game and nowhere else
 
 
 def _focused_item(snapshot: dict) -> dict | None:
@@ -283,36 +297,121 @@ def pick_menu_action(kd: KDClient, pad: VirtualPad, action: str) -> None:
 # ── the performance HUD ──────────────────────────────────────────────────────
 
 def expect_no_hud_card(kd: KDClient, what: str) -> None:
-    """The HUD is a game's business. Over anything else the card must not be there —
-    a silent regression nobody would notice until the menu grew a card that does
-    nothing."""
     if _section(kd.snapshot(), HUD) is None:
-        report(f'no HUD card over the {what}', 'PASS', 'the toggle is offered to games only')
+        report(f'no HUD slider over the {what}', 'PASS', 'the slider is offered to games only')
         return
-    report(f'no HUD card over the {what}', 'FAIL', 'the HUD toggle is on the menu')
+    report(f'no HUD slider over the {what}', 'FAIL', 'the HUD slider is on the menu')
 
 
-def toggle_hud(kd: KDClient, pad: VirtualPad) -> None:
-    """Flip the HUD from the menu, and check that KD's own state flipped with it."""
-    snapshot = kd.snapshot()
-    if _section(snapshot, HUD) is None:
-        report('the menu offers the HUD toggle', 'FAIL', 'no HUD card over the game')
-        raise ScenarioAborted('the HUD toggle is not on the menu')
-    was = snapshot['hud']['enabled']
-    report('the menu offers the HUD toggle', 'PASS',
-           f'{_section(snapshot, HUD)["items"][0]["label"]!r} '
-           f'(HUD is {"on" if was else "off"})')
+def hud_level(kd: KDClient) -> int:
+    return kd.snapshot()['hud']['level']
 
-    pick_menu_action(kd, pad, TOGGLE_HUD)
+
+def step_hud_level(kd: KDClient, pad: VirtualPad, step: int) -> None:
+    if _section(kd.snapshot(), HUD) is None:
+        report('the menu offers the HUD slider', 'FAIL', 'no HUD slider over the game')
+        raise ScenarioAborted('the HUD slider is not on the menu')
+    was = hud_level(kd)
+    focus_menu_action(kd, pad, HUD_LEVEL)
+    report('the menu offers the HUD slider', 'PASS', f'HUD level {was}')
+
+    pad.right() if step > 0 else pad.left()
+    expected = was + step
     try:
-        kd.wait_until(lambda s: s['hud']['enabled'] != was, timeouts.CEDE,
-                      f'the HUD to turn {"off" if was else "on"}')
+        kd.wait_until(lambda s: s['hud']['level'] == expected, timeouts.CEDE,
+                      f'the HUD level to reach {expected}')
     except TimeoutError:
-        report('the HUD toggle takes effect', 'FAIL',
-               f'still {"on" if was else "off"} after the press')
+        report('the HUD slider takes effect', 'FAIL',
+               f'still {hud_level(kd)} after the press, expected {expected}')
         return
-    report('the HUD toggle takes effect', 'PASS',
-           f'{"on" if was else "off"} → {"off" if was else "on"}')
+    report('the HUD slider takes effect', 'PASS', f'{was} → {expected}')
+
+
+# ── a tile's own popover ─────────────────────────────────────────────────────
+
+LAUNCH   = 'launch'
+RESTORE  = 'restore'
+CLOSE    = 'close'
+MOVE     = 'move'
+SETTINGS = 'settings'
+UNPIN    = 'unpin'
+
+
+def expect_tile_running(kd: KDClient, tile_id: str, running: bool = True) -> None:
+    tile = kd.tile(tile_id)
+    if tile['running'] is running:
+        report(f'the {tile_id!r} tile reads as {_running_word(running)}', 'PASS')
+        return
+    report(f'the {tile_id!r} tile reads as {_running_word(running)}', 'FAIL',
+           f'KD says {_running_word(tile["running"])}')
+
+
+def _running_word(running: bool) -> str:
+    return 'running' if running else 'not running'
+
+
+def _focused_tile_item(snapshot: dict) -> dict | None:
+    return next((item for item in snapshot['tile_menu']['items'] if item['focused']),
+                None)
+
+
+def open_tile_menu(kd: KDClient, pad: VirtualPad, tile_id: str) -> None:
+    focus_tile(kd, pad, tile_id)
+    pad.tile_menu()
+    try:
+        kd.wait_until(lambda s: s['tile_menu']['open'], timeouts.HOME_MENU,
+                      f'the popover of the {tile_id!r} tile')
+    except TimeoutError as exc:
+        report('tile menu open', 'FAIL', 'X pressed on the tile, no popover appeared')
+        raise ScenarioAborted('the tile popover never opened') from exc
+    focused = _focused_tile_item(kd.snapshot())
+    report('tile menu open', 'PASS',
+           f'focused on {focused["label"]!r}' if focused else 'nothing focused')
+
+
+def expect_tile_menu_offers(kd: KDClient, actions: tuple[str, ...]) -> None:
+    offered = tuple(item['action'] for item in kd.snapshot()['tile_menu']['items']
+                    if item['action'] != 'separator')
+    if offered != actions:
+        report('the tile menu offers what it should', 'FAIL',
+               f'expected {list(actions)}, found {list(offered)}')
+        return
+    report('the tile menu offers what it should', 'PASS', f'{list(offered)}')
+
+
+def pick_tile_action(kd: KDClient, pad: VirtualPad, action: str) -> None:
+    items = [item['action'] for item in kd.snapshot()['tile_menu']['items']]
+    if action not in items:
+        report(f'picked {action!r} in the tile menu', 'FAIL', f'not offered: {items}')
+        raise ScenarioAborted(f'{action!r} is not in the tile menu')
+
+    for _ in range(len(items) + 1):
+        focused = _focused_tile_item(kd.snapshot())
+        if focused is not None and focused['action'] == action:
+            pad.confirm()
+            report(f'picked {action!r} in the tile menu', 'PASS',
+                   f'A pressed on {focused["label"]!r}')
+            return
+        before = focused['action'] if focused else None
+        pad.down()
+        try:
+            kd.wait_until(
+                lambda s, b=before: (_focused_tile_item(s) or {}).get('action') != b,
+                timeouts.TILE_FOCUS, f'the popover cursor to move off {before!r}')
+        except TimeoutError:
+            report(f'picked {action!r} in the tile menu', 'FAIL',
+                   f'the cursor would not move off {before!r}')
+            raise ScenarioAborted('the tile popover cursor is stuck')
+
+    report(f'picked {action!r} in the tile menu', 'FAIL',
+           f'walked the whole popover without reaching {action!r}')
+    raise ScenarioAborted(f'{action!r} never took the focus')
+
+
+def close_from_open_menu(kd: KDClient, pad: VirtualPad, about: str) -> None:
+    pick_menu_action(kd, pad, CLOSE_APP)
+    expect_confirm(kd, about=about)
+    confirm(kd, pad)
 
 
 def expect_minimized(kd: KDClient) -> None:

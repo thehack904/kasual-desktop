@@ -7,11 +7,17 @@ this suite is run by hand against a live session before a release, not in CI. It
 needs a Wayland session, a GPU and real games, and its scenarios may be hardcoded
 to one developer machine's library.
 
-It runs on every compositor Kasual Desktop supports — KDE, GNOME, Hyprland and
-Sway — each proven on a live session, the whole suite green on all four. A scenario
-names the windows it needs and the harness picks the backend for whatever is
-running; see `PORTING.md` for how that was arrived at, down to the last product gap
-it exposed (Sway would not focus a launcher behind a fullscreen window) and closed.
+It runs on every compositor Kasual Desktop supports. KDE, GNOME, Hyprland, Sway and
+COSMIC are each proven on a live session, the whole suite green on all five. A
+scenario names the windows it needs and the harness picks the backend for whatever
+is running; see `PORTING.md` for how that was arrived at, down to the last product
+gap it exposed (Sway would not focus a launcher behind a fullscreen window, COSMIC
+left a game in a window it had sized to the whole screen) and closed.
+
+labwc and wayfire (Raspberry Pi OS) have a backend too — the same
+wlr-foreign-toplevel connection the product uses — but no run on real hardware
+yet. It reports no geometry, so there `covers_screen` is always False and only a
+window that declares itself fullscreen counts as holding the screen.
 
 ## Why this exists
 
@@ -232,12 +238,20 @@ Inside `harness/`:
   behind on someone's desktop. Read-only by design: Steam *could* be driven from here
   (the protocol dispatches input, and `SteamClient` is right there), but then the run
   would prove something about Steam's DOM instead of about KD's re-emitted pad.
+- **Steps against the File Browser** — `file_browser.py`: `FileBrowserClient` reads the
+  bundled browser's own test API (published only under `KD_TEST_API=1`, which it
+  inherits from the KD that launched it) — where it is and what its cursor is on — so
+  "I walked its folders" is a fact, not a guess at an unchanging window title.
 - **The run** — `session.py`: bring-up, teardown, artifact, exit code. A scenario
   body starts with KD already on the Home view and both sources of truth open, and
   may give up anywhere by raising `ScenarioAborted` — the teardown still runs.
 - **Preconditions** — `requirements.py` (see below).
 - **Verdicts** — `report.py` (`PASS`/`FAIL`/`WARN`/`INFO`); every wait in the
   harness is a named constant in `timeouts.py`.
+- **Live progress** — `progress.py`: the wait a step is in, its elapsed seconds and its
+  budget, on one refreshing line — so a long silent wait (Steam coming up, shaders
+  compiling) reads as progress, not a hang. `--notify` also raises a desktop
+  notification for the long ones, the one message that carries past a fullscreen game.
 
 Two sources of truth, deliberately: other applications' windows come from the
 compositor, KD's own layer-shell surfaces come from KD.
@@ -259,13 +273,14 @@ def _body(session: Session) -> None:
     window = game.wait_fullscreen()
     game.check_process(window)
     shell.check_kd_ceded(session.kd)
-    shell.check_home_menu_over_game(session.kd, session.pad)
+    shell.check_home_menu_over_game(session.kd, session.pad, game)
 
 SCENARIO = Scenario(
     name='kcd',
     title='launch Kingdom Come: Deliverance from its tile, recall the Home Menu over it',
     body=_body,
     requires=(
+        require.window_source(),
         require.command('steam'),
         require.manual('Steam is logged in, and Kingdom Come: Deliverance is installed'),
         require.tile(TILE_ID),
@@ -286,10 +301,30 @@ first draft of this suite "passed" through.
   is a failure invisible from inside KD: a Desktop that believes it is minimized while
   its chrome still floats over the DE looks perfectly fine to itself, so the assertions
   are about *absence* — no tiles, no wallpaper, no header, no hint bar, no menu.
-- **`kcd`** — tile → Steam → the splash → the game → the Home Menu over it. The only
-  game scenario still launched from the game's own tile.
+- **`file_browser`** — tile → the bundled File Browser → walk its folders → Home menu
+  → Close → back on the Desktop. The full life of a bundled app, and the one scenario
+  that reads *both* ends of the pad's journey: KD says the press left its hands, the
+  browser's own test API says it arrived. Closing goes through the Home menu's confirm,
+  so the run reads the question and which way it is aimed before answering it.
+- **`kcd`** — tile → a warmed Steam → the splash → the game → the Home Menu over it,
+  where the in-game HUD toggle is exercised (the one place a game is already up to test
+  it against). Launched from the game's own tile. The warm-up starts Steam with
+  `MANGOHUD=1`, because it is the running client — not the `steam://` forwarder KD
+  spawns — that starts the game, and a game without the layer gets no toggle at all.
+- **`kcd_cold`** — the same tile, but with Steam **cold**: the `steam://rungameid` URL
+  opens Big Picture and drops the launch, so the run pushes the game through Steam's UI
+  with the pad, then asserts the game reaches the screen and the Home Menu comes back
+  over it as before.
 - **`steam_kcd`** — tile → Big Picture → Steam's own UI, walked with the pad → the
-  game. Proves KD's re-emitted pad reaches a foreign application.
+  game → and back out through the Home Menu. Proves KD's re-emitted pad reaches a
+  foreign application, and then that a "Close" press ends what it names: the game,
+  whose window KD can only *ask* to go, and Steam, whose process group KD started and
+  owns. The one scenario that leaves the way a player does — everywhere else the
+  teardown's kill is the exit, and proves nothing about KD.
+- **`running_tile`** — tile → File Browser → "Return to Home screen" with it still
+  running → close it from the tile's own popover. The other way out of an app and the
+  other way of ending one: `file_browser` never leaves the app, this one walks away and
+  meets it again as a tile that knows it is running.
 - **`steam_w3`** — the same walk through Steam's UI, but the game stops at the RED Launcher,
   which has to be *used*: a window that maps after KD has ceded and must still be
   reachable by the pad.
@@ -319,12 +354,20 @@ Every scenario needs:
   packaged, menu-launched instance always is, and which nothing about it betrays
   until you notice it never answers.
 
+`file_browser` needs only a KD tile for `files` that launches the **repo's** copy of
+the browser — the one that publishes the test API (an installed copy under `/usr/share`
+does not).
+
 `kcd` additionally needs:
 
 - Steam installed, **[!]** logged in, with the game installed.
 - A KD tile for the game (`TILE_ID` at the top of the scenario, matched against the
   `.desktop` stem or the displayed name; on a miss the error lists the tiles that
   exist).
+
+`kcd_cold` needs the same tile and game, but with Steam **not running** (the cold start
+is the whole point) and **[!]** the game among Big Picture's recent games — the row the
+push walks when the cold start drops the launch.
 
 `steam_kcd` and `steam_w3` need instead:
 
@@ -342,19 +385,61 @@ will want a logged-in session in the YT app, and it will say so in its own
 
 ## Running it (any supported compositor / Wayland)
 
-Start Kasual Desktop with the test API on, and leave it there — with no controller
-connected it holds off the screen, showing nothing:
+Beyond what Kasual Desktop itself needs, the Steam scenarios read Big Picture back
+over the Chrome DevTools Protocol, which takes one extra package:
 
 ```
-KD_TEST_API=1 ./kasual.sh
+pip install websocket-client        # NOT "websocket" — see below
 ```
 
-Then, in another terminal:
+Two different PyPI packages install a module called `websocket`. The wanted one is
+**`websocket-client`**; there is also an abandoned stub simply named `websocket`
+that has none of its functions, and whichever was installed last owns the name. The
+import succeeds either way, so `require.steam_devtools_client()` checks for the
+functions rather than the module — otherwise the mistake only surfaces mid-scenario,
+as an `AttributeError` against a Steam that is by then already running. If both are
+installed, drop the stub: `pip uninstall websocket`.
+
+On COSMIC, both KD and this harness reach a game through the XWayland window behind
+it, with python-xlib:
 
 ```
-python3 tests/behavioral/run.py             # all of them, one after another
-python3 tests/behavioral/run.py kcd         # just this one
-python3 tests/behavioral/run.py --list      # what there is and what it needs; runs nothing
+pip install python-xlib             # packaged as python3-xlib; a venv may not see it
+```
+
+It is a packaged dependency of KD, so an installed COSMIC session already has it —
+but a virtualenv built without `--system-site-packages` does not, and everything
+degrades quietly: every game window comes back as pid 0, `game process alive` fails
+against a game that is plainly running, the cleanup has no process to close, and KD
+cannot ask COSMIC to fullscreen a game that never asks for itself (see
+`infrastructure/cosmic/wm/fullscreen.py`). `require.compositor_ready()` says so
+before a run instead.
+
+`tests_behav.sh` is the one entry point, in two commands. In one terminal, `prepare`
+seeds a throwaway config, points KD at it with `KD_CONFIG_DIR`, and launches KD with
+the test API on — leave it there; with no controller connected it holds off the
+screen, showing nothing:
+
+```
+./tests_behav.sh prepare           # --seed by default; --empty for the onboarding flow
+```
+
+The seed holds just the tiles the scenarios touch (plus YouTube), so they are
+present whatever the machine's own catalog looks like, and KD's writes land in the
+temp directory instead of your real config — `config_root()` honours `KD_CONFIG_DIR`
+over `XDG_CONFIG_HOME`. The seed also marks KD's HUD setup card as seen, so no card
+interrupts a run: the session deliberately does *not* carry `MANGOHUD`, since that
+would load MangoHud into every app the scenarios launch (it aborts the bundled File
+Browser), and each scenario arms the HUD for its own game instead. (The steps are
+also runnable by hand: `prepare_config.py` prints the `export KD_CONFIG_DIR=…` line,
+then `KD_TEST_API=1 ./kasual.sh`.)
+
+Then, in another terminal, `run` — its arguments pass straight to `run.py`:
+
+```
+./tests_behav.sh run                # all of them, one after another
+./tests_behav.sh run kcd            # just this one
+./tests_behav.sh run --list         # what there is and what it needs; runs nothing
 ```
 
 The run's virtual pad is what brings KD up: it appears as a controller, KD's device
@@ -420,8 +505,6 @@ And five paid for by `steam_kcd`, every one of them a press that vanished:
   requirements disappear, and so does "is /usr/share current?". (Swapping
   `XDG_CONFIG_HOME` would do it without touching Kasual Desktop, but it takes the
   preferences with it.)
-- A scenario for closing an app *the way a user does* (Home Menu → close → KD
-  returns), kept separate from the launch scenarios on purpose.
 - MangoHud FPS as proof the game actually renders; today a fullscreen window is
   taken as proof enough.
 - **Shader-processing progress, from the same channel `steam_kcd` reads.** Between the

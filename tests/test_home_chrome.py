@@ -132,6 +132,17 @@ class TestSurfaceVisibilitySync:
         chrome.sync()
         assert surface.calls == []
 
+    def test_dropping_the_open_menu_takes_it_and_the_bar_down_with_the_desktop(self):
+        surface = FakeHomeSurface(expanded=True)
+        hintbar = FakeHintBar()
+        chrome, _ = _chrome(visible=False, surface=surface, hintbar=hintbar)
+        chrome.begin_overlay_hints()
+        chrome.drop_open_menu()
+        chrome.sync()
+        assert not surface.is_open()
+        assert surface.calls[-1] == "hide"
+        assert hintbar.calls[-1] == "hide"
+
     def test_no_surface_is_fine(self):
         chrome, _ = _chrome(visible=True, surface=None)
         chrome.sync()   # must not raise
@@ -233,6 +244,20 @@ class TestHeaderStatus:
         chrome.update_network_status(status)
         assert chrome.network_status is status
         assert len(header.network_icons) == 1
+
+    def test_offline_icon_remembers_the_last_link(self):
+        header = FakeHeader()
+        chrome, _ = _chrome(header=header)
+        chrome.update_network_status(NetworkStatus(kind=NetworkKind.ETHERNET))
+        chrome.update_network_status(NetworkStatus.offline())
+        assert header.network_icons[-1] == "mdi.lan-disconnect"
+        assert chrome.network_icon == "mdi.lan-disconnect"
+
+    def test_offline_icon_is_generic_before_any_link(self):
+        header = FakeHeader()
+        chrome, _ = _chrome(header=header)
+        chrome.update_network_status(NetworkStatus.offline())
+        assert header.network_icons == ["mdi6.web-off"]
 
     def test_badge_mirrors_unread_count(self):
         header = FakeHeader()

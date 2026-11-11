@@ -60,9 +60,9 @@ class TilePopoverMenu(QWidget):
 
         self._card = QWidget()
         self._card.setStyleSheet(
-            "QWidget { background-color: #2e3440;"
+            f"QWidget {{ background-color: {styles.COLOR_CARD_BG};"
             " border-radius: 36px;"
-            " border: 1px solid rgba(255,255,255,18); }"
+            " border: 1px solid rgba(255,255,255,18); }}"
         )
         card_layout = QVBoxLayout(self._card)
         card_layout.setContentsMargins(8, 8, 8, 8)
@@ -105,6 +105,14 @@ class TilePopoverMenu(QWidget):
         self._gamepad.push_handler(self._handle_pad)
         self._feedback.play(Cue.POPUP_OPEN)
         QApplication.instance().installEventFilter(self)
+
+    @property
+    def items(self) -> list[MenuItem]:
+        return self._items
+
+    @property
+    def focused_index(self) -> int:
+        return self._cursor.index
 
     def show_above(self, tile: QWidget) -> None:
         """Position and display the popover above *tile*."""

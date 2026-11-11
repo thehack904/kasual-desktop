@@ -3,14 +3,15 @@
 import logging
 from collections.abc import Callable
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QGuiApplication
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import QWidget
 
 from domain.input.pad_control import PadControl
 from domain.shared.feedback import Cue, Feedback
 from infrastructure.common.qt.ui import styles
 from infrastructure.common.qt.ui.layer_shell import Layer, Anchor, Keyboard
+from infrastructure.common.qt.ui.surface_hiding import SurfaceHiding
+from infrastructure.common.qt.ui.target_screen import narrower_than_target_screen, target_screen
 from infrastructure.common.qt.ui.top_surface import (
     fullscreen_loses_translucency, promote_overlay_surface,
 )
@@ -75,6 +76,7 @@ class BaseOverlay(QWidget):
             exclusive_zone=-1,
             keyboard=keyboard,
         )
+        self._hiding = SurfaceHiding(self, Anchor.ALL)
 
     def _show(self) -> None:
         """Register the gamepad handler and display the overlay."""
@@ -91,22 +93,32 @@ class BaseOverlay(QWidget):
     def _cover_the_screen(self) -> None:
         """Fill the screen, staying an ordinary window where fullscreen would cost
         the dim backdrop its alpha."""
+        self._hiding.unhide()
         if not fullscreen_loses_translucency():
             self.showFullScreen()
             return
-        screen = self.screen() or QGuiApplication.primaryScreen()
+        self._fill_target_screen()
+        self.show()
+
+    def _fill_target_screen(self) -> None:
+        screen = target_screen()
         if screen is not None:
             # Fixed, or Mutter maximizes a screen-filling window into the work area
             # and a maximized window is denied the layer that keeps it above the
             # fullscreen Desktop.
             self.setFixedSize(screen.geometry().size())
-        self.show()
+            self.resize(screen.geometry().size())
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if fullscreen_loses_translucency() and narrower_than_target_screen(self):
+            QTimer.singleShot(0, self._fill_target_screen)
 
     def pause(self) -> None:
         """Temporarily hide the overlay (e.g. when the Desktop is minimized)."""
         if not self._closed:
             self._gamepad.pop_handler(self._handler)
-            self.hide()
+            self._hiding.hide()
 
     def resume(self) -> None:
         """Restore the overlay after a pause."""
@@ -122,7 +134,7 @@ class BaseOverlay(QWidget):
         return self._card
 
     def _dismiss(self, *, sound: Cue | None = None) -> bool:
-        """Tear the overlay down once: deregister the pad handler, hide, delete.
+        """Tear the overlay down once: deregister the pad handler, leave, give up.
 
         Returns False if it was already closed, so callers can guard one-shot
         side effects (callbacks, signals). Optionally plays a close sound.
@@ -134,8 +146,7 @@ class BaseOverlay(QWidget):
         self._gamepad.pop_handler(self._handler)
         if sound is not None:
             self._feedback.play(sound)
-        self.hide()
-        self.deleteLater()
+        self._hiding.retire()
         return True
 
     def cancel(self) -> None:
@@ -143,12 +154,11 @@ class BaseOverlay(QWidget):
         or when the underlying app vanished).
 
         Idempotent and tolerant of an already-closed overlay: still ensures the
-        widget is hidden and scheduled for deletion."""
+        widget leaves the screen and is given up."""
         if not self._closed:
             self._closed = True
             self._gamepad.pop_handler(self._handler)
-        self.hide()
-        self.deleteLater()
+        self._hiding.retire()
 
     def _on_outside_click(self) -> None:
         """Action when the backdrop (outside the card) is clicked. Default: keep

@@ -9,6 +9,7 @@ from domain.shared.i18n import translate
 from domain.system.desktop_shell import DesktopShell
 from domain.system.power_control import PowerControl
 
+CONFIGURATION = "configuration"
 NETWORK       = "network"
 NOTIFICATIONS = "notifications"
 VOLUME        = "volume"
@@ -17,6 +18,7 @@ SLEEP         = "sleep"
 RESTART       = "restart"
 SHUTDOWN      = "shutdown"
 HIDE_DESKTOP  = "hide_desktop"
+GAMEPAD_ACCESS = "gamepad_access"
 
 # First is the out-of-the-box default.
 POWER_ACTIONS = (SLEEP, RESTART, SHUTDOWN)
@@ -81,6 +83,10 @@ ACTIONS: dict[str, SystemAction] = {
         lambda d: d.desktop.open_notifications_overlay(),
         translate("Kasual Desktop", "Notifications"), "fa5s.bell", "#ebcb8b",
     ),
+    CONFIGURATION: SystemAction(
+        lambda d: d.desktop.open_configuration_overlay(),
+        translate("Kasual Desktop", "Configuration"), "fa5s.cog", "#88c0d0",
+    ),
     NETWORK: SystemAction(
         lambda d: d.desktop.open_network_overlay(),
         translate("Kasual Desktop", "Network"), "fa5s.wifi", "#81a1c1",  # icon overridden live
@@ -88,5 +94,9 @@ ACTIONS: dict[str, SystemAction] = {
     HIDE_DESKTOP: SystemAction(
         lambda d: d.desktop.pause(),
         translate("Kasual Desktop", "Minimize Kasual Desktop"), "fa5s.window-minimize", "#d580ff",
+    ),
+    GAMEPAD_ACCESS: SystemAction(
+        lambda d: d.desktop.open_gamepad_access_check(),
+        translate("Kasual Desktop", "Check gamepad access"), "fa5s.gamepad", "#8fbcbb",
     ),
 }

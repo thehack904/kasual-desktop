@@ -14,12 +14,11 @@ candidate list + callbacks, so it's reusable beyond first-run onboarding.
 import logging
 from collections.abc import Callable
 
-import qtawesome as qta
 from PyQt6.QtCore import Qt, QSize
 from PyQt6.QtGui import QIcon, QKeyEvent
 from PyQt6.QtWidgets import (
     QWidget, QPushButton, QVBoxLayout, QLabel, QSizePolicy,
-    QScrollArea, QFrame, QApplication,
+    QScrollArea, QFrame,
 )
 
 from domain.input.pad_control import PadControl
@@ -32,6 +31,7 @@ from domain.shared.feedback import Cue, Feedback
 from infrastructure.common.qt._meta import ProtocolQtMeta
 from infrastructure.common.qt.ui import styles
 from infrastructure.common.qt.ui.layer_shell import Keyboard
+from infrastructure.common.qt.ui.target_screen import target_screen
 from infrastructure.common.qt.ui.toggle_switch import ToggleSwitch
 from .base_overlay import BaseOverlay
 
@@ -101,7 +101,7 @@ class OnboardingOverlay(BaseOverlay, ProvisioningView, metaclass=ProtocolQtMeta)
         self._title = QLabel(self.tr("Welcome — pick your apps"))
         self._title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._title.setStyleSheet(
-            "font-size: 28px; color: #88c0d0; font-weight: bold;"
+            f"font-size: 28px; color: {styles.COLOR_ACCENT}; font-weight: bold;"
             " background: transparent; padding-bottom: 8px;"
         )
         layout.addWidget(self._title)
@@ -163,7 +163,7 @@ class OnboardingOverlay(BaseOverlay, ProvisioningView, metaclass=ProtocolQtMeta)
         Confirm sits below the scroll, so it is not counted here."""
         n = max(1, len(self._rows))
         content = n * 62 + (n - 1) * 8
-        screen = QApplication.primaryScreen()
+        screen = target_screen()
         cap = int(screen.availableGeometry().height() * 0.55) if screen else 560
         self._scroll.setFixedHeight(min(content, cap))
 
@@ -195,18 +195,8 @@ class OnboardingOverlay(BaseOverlay, ProvisioningView, metaclass=ProtocolQtMeta)
 
     @staticmethod
     def _candidate_icon(candidate: CandidateApp) -> QIcon | None:
-        """The row icon for a candidate, mirroring the tile bar's resolution: the
-        Font Awesome glyph or themed ``Icon`` when set, else — for apps whose
-        command is a real file (e.g. a Windows ``.lnk``/exe) — the OS shell icon."""
-        app = candidate.app
-        if app.icon:
-            return qta.icon(app.icon, color="white")
-        if app.icon_theme:
-            themed = QIcon.fromTheme(app.icon_theme)
-            if not themed.isNull():
-                return themed
-        from infrastructure.common.qt.icons import shell_icon
-        return shell_icon(app.command)
+        from infrastructure.common.qt.icons import resolve_app_icon
+        return resolve_app_icon(candidate.app)
 
     def _bind_hover(self, btn: QPushButton, index: int) -> None:
         """Move the cursor onto *index* when the pointer enters *btn* (with the

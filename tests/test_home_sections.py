@@ -5,31 +5,26 @@ no Qt. Labels come back localized (identity without a translator installed).
 """
 
 from domain.menu.entry import (
-    CLOSE_APP, POWER, RETURN_TO_APP, RETURN_TO_DESKTOP, TOGGLE_HUD,
+    CLOSE_APP, POWER, RETURN_TO_APP, RETURN_TO_DESKTOP, HUD_LEVEL,
 )
 from domain.menu.home import SectionKind, compose_home_sections
 from domain.system.actions import (
-    BRIGHTNESS, HIDE_DESKTOP, NETWORK, NOTIFICATIONS, RESTART, SHUTDOWN, SLEEP, VOLUME,
+    BRIGHTNESS, CONFIGURATION, GAMEPAD_ACCESS, HIDE_DESKTOP, NETWORK, NOTIFICATIONS, RESTART,
+    SHUTDOWN, SLEEP, VOLUME,
 )
 from domain.catalog.target import AppTarget, WindowTarget
 
 
 class FakeHud:
-    def __init__(self, available=False, enabled=True):
+    def __init__(self, available=False, attached=True):
         self._available = available
-        self._enabled = enabled
+        self._attached = attached
 
     def is_available(self):
         return self._available
 
-    def is_enabled(self):
-        return self._enabled
-
-    def enable(self):
-        self._enabled = True
-
-    def disable(self):
-        self._enabled = False
+    def is_attached(self, pid):
+        return self._attached
 
 
 def _desktop(brightness=True, power_default=SLEEP):
@@ -59,7 +54,7 @@ class TestDesktopContext:
     def test_actions_lead_with_power_then_system_grid(self):
         actions = _by_kind(_desktop(), SectionKind.ACTIONS)
         assert [i.action for i in actions.items] == [
-            POWER, NETWORK, NOTIFICATIONS, HIDE_DESKTOP, RETURN_TO_DESKTOP,
+            POWER, CONFIGURATION, NETWORK, NOTIFICATIONS, HIDE_DESKTOP, RETURN_TO_DESKTOP,
         ]
 
     def test_return_to_home_present_so_minimized_kd_can_be_restored(self):
@@ -122,7 +117,7 @@ class TestAppContext:
     def test_hud_section_when_game_and_available(self):
         s = self._app(hud=FakeHud(available=True), game=True)
         hud = _by_kind(s, SectionKind.HUD)
-        assert [i.action for i in hud.items] == [TOGGLE_HUD]
+        assert [i.action for i in hud.items] == [HUD_LEVEL]
 
     def test_no_hud_section_when_unavailable(self):
         s = self._app(hud=FakeHud(available=False), game=True)
@@ -132,6 +127,10 @@ class TestAppContext:
         s = self._app(hud=FakeHud(available=True), game=False)
         assert all(sec.kind != SectionKind.HUD for sec in s.sections)
 
+    def test_no_hud_section_when_the_game_does_not_carry_the_hud(self):
+        s = self._app(hud=FakeHud(available=True, attached=False), game=True)
+        assert all(sec.kind != SectionKind.HUD for sec in s.sections)
+
     def test_window_target_label_and_cancel(self):
         target = WindowTarget(window_id="w1", name="Game")
         s = compose_home_sections(
@@ -139,3 +138,38 @@ class TestAppContext:
         actions = _by_kind(s, SectionKind.ACTIONS)
         assert "Game" in actions.items[0].label
         assert s.cancel_restores == target
+
+
+class TestGamepadAccessEntry:
+    """The entry that reopens the gamepad-access card. Offered only while the pad
+    comes from evdev and its access is still not granted — never on Windows."""
+
+    def _actions(self, **kwargs):
+        sections = compose_home_sections(
+            None, FakeHud(), brightness_controllable=True, power_default=SLEEP,
+            **kwargs)
+        return [i.action for i in _by_kind(sections, SectionKind.ACTIONS).items]
+
+    def test_offered_while_access_is_missing(self):
+        assert GAMEPAD_ACCESS in self._actions(gamepad_access_needed=True)
+
+    def test_withheld_once_access_is_granted(self):
+        assert GAMEPAD_ACCESS not in self._actions(gamepad_access_needed=False)
+
+    def test_withheld_by_default(self):
+        assert GAMEPAD_ACCESS not in self._actions()
+
+    def test_it_does_not_displace_the_way_back(self):
+        """Return to Home screen stays last: minimized, it is the only way back."""
+        actions = self._actions(gamepad_access_needed=True)
+        assert actions[-1] == RETURN_TO_DESKTOP
+        assert actions[-2] == HIDE_DESKTOP
+
+    def test_it_is_not_offered_over_a_running_app(self):
+        """The card is modal and would take the screen from the foreground."""
+        sections = compose_home_sections(
+            AppTarget(index=0, app_id="steam", name="Steam"), FakeHud(),
+            brightness_controllable=True, power_default=SLEEP,
+            gamepad_access_needed=True)
+        actions = _by_kind(sections, SectionKind.ACTIONS).items
+        assert all(i.action != GAMEPAD_ACCESS for i in actions)

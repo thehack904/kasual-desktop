@@ -5,14 +5,17 @@ The controller is pure wiring (no Qt): it subscribes to the gamepad through the
 port, and routes activated menu items. Here we drive it entirely over fakes.
 """
 
+from unittest.mock import MagicMock
+
 from application import Application
 from domain.shared.event_emitter import EventEmitter
 from domain.input.gamepad_events import (
     BtnModePressed, GamepadConnected, GamepadDisconnected,
 )
-from domain.menu.entry import CLOSE_APP, RETURN_TO_APP, RETURN_TO_DESKTOP, TOGGLE_HUD
+from domain.menu.entry import CLOSE_APP, RETURN_TO_APP, RETURN_TO_DESKTOP
 from domain.menu.item import MenuItem
 from domain.system.actions import ActionDeps, HIDE_DESKTOP
+from domain.system.hud import HUD_OFF, HudLevel
 from domain.catalog.app import App
 
 
@@ -57,8 +60,10 @@ class FakeOverlay:
         self.on_cancel = None
 
     def show_for_context(self, foreground, foreground_is_game, hud,
-                         on_action, on_cancel, set_hints, desktop_minimized=False):
+                         on_action, on_cancel, set_hints, desktop_minimized=False,
+                         foreground_pid=None):
         self.shown_with = (foreground, on_action, on_cancel)
+        self.shown_pid = foreground_pid
         self.on_action = on_action
         self.on_cancel = on_cancel
         self._showing = True
@@ -108,9 +113,10 @@ class FakeOverlayFactory:
 class FakeDesktop:
     """Plays DesktopControl, SessionView and DesktopShell for the controller."""
 
-    def __init__(self, current=None, foreground=None):
+    def __init__(self, current=None, foreground=None, game_pid=None):
         self._current = current
         self._foreground = foreground
+        self._game_pid = game_pid
         self.restored: list = []
         self.closed: list = []
         self.show_desktop_calls = 0
@@ -155,6 +161,9 @@ class FakeDesktop:
 
     def foreground_pid(self):
         return self._foreground
+
+    def foreground_game_pid(self):
+        return self._game_pid
 
     def foreground_is_game(self):
         return getattr(self, "_is_game", False)
@@ -201,16 +210,13 @@ class FakePower:
 
 
 class FakeHud:
-    """HudControl port — records enable/disable and starts unavailable."""
-
-    def __init__(self, available=False, enabled=True):
+    def __init__(self, available=False):
         self.available = available
-        self.enabled = enabled
+        self.current = HudLevel(HUD_OFF, 4)
 
     def is_available(self): return self.available
-    def is_enabled(self): return self.enabled
-    def enable(self): self.enabled = True
-    def disable(self): self.enabled = False
+    def level(self): return self.current
+    def set_level(self, level): self.current = level
 
 
 def make_app(desktop=None, gamepad=None, factory=None, tray=None, wm=None, hud=None):
@@ -229,6 +235,7 @@ def make_app(desktop=None, gamepad=None, factory=None, tray=None, wm=None, hud=N
         wm=wm,
         overlay_factory=factory,
         hud=hud,
+        sound=MagicMock(),
     )
     return controller, desktop, gamepad, factory, tray, wm
 
@@ -244,6 +251,13 @@ class TestBtnModeOverlay:
         assert overlay.is_showing()
         items, on_select, _ = overlay.shown_with
         assert on_select == controller._dispatch_home
+
+    def test_overlay_is_told_which_process_the_game_renders_through(self):
+        """The HUD toggle is offered only where the HUD is loaded into that
+        process, so an overlay opened without it silently loses the card."""
+        _, _, gamepad, factory, _, _ = make_app(desktop=FakeDesktop(game_pid=4242))
+        gamepad.fire_btn_mode()
+        assert factory.created[0].shown_pid == 4242
 
     def test_second_press_while_showing_hides(self):
         _, _, gamepad, factory, _, _ = make_app()
@@ -348,14 +362,6 @@ class TestDispatchHome:
         controller, desktop, *_ = make_app()
         controller._dispatch_home(MenuItem("Minimize", HIDE_DESKTOP))
         assert desktop.paused == 1
-
-    def test_toggle_hud_flips_state(self):
-        hud = FakeHud(available=True, enabled=True)
-        controller, *_ = make_app(hud=hud)
-        controller._dispatch_home(MenuItem("Disable HUD", TOGGLE_HUD))
-        assert hud.enabled is False
-        controller._dispatch_home(MenuItem("Enable HUD", TOGGLE_HUD))
-        assert hud.enabled is True
 
 
 # ── connect / disconnect → session policy ────────────────────────────────────

@@ -5,24 +5,31 @@ import sys
 from pathlib import Path
 
 from infrastructure.linux.compositor import (
-    Compositor, build_desktop_surface, build_screensaver_waker,
-    build_system_wallpaper, build_window_manager, detect_compositor,
+    CEDE_BY_SINKING, Compositor, build_desktop_surface, build_display_placement,
+    build_primary_display, build_screensaver_waker,
+    build_system_wallpaper, build_tray_icon_source, build_window_manager,
+    detect_compositor, layer_shell_available,
 )
 
 # The platform and the shell integration must be selected before QApplication is
 # created; setdefault lets the environment override (e.g. tests force offscreen).
-# Mutter has no layer-shell, and naming the missing integration makes the wayland
-# plugin itself fail to load — there Kasual is a plain window the extension pins.
-os.environ.setdefault("QT_QPA_PLATFORM", "wayland")
-if detect_compositor() is not Compositor.GNOME:
+# Naming an integration Qt cannot load is not a soft failure: the Wayland plugin
+# then has none at all and every window stays unmapped, so Kasual runs, logs
+# nothing obviously wrong, and is invisible.
+COMPOSITOR = detect_compositor()
+# Not merely "not GNOME": naming an integration this Qt cannot load leaves the
+# Wayland plugin with none at all, and every window then stays unmapped.
+LAYER_SHELL = layer_shell_available(COMPOSITOR)
+if LAYER_SHELL:
     os.environ.setdefault("QT_WAYLAND_SHELL_INTEGRATION", "layer-shell")
 
 from PyQt6.QtCore import QTimer
+from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import QApplication
 
-from version import get_version, is_packaged
+from version import get_version, test_api_enabled
 from session import (
-    build_controller, build_tray, defer_start,
+    build_controller, build_tray, defer_start, follow_chosen_display,
     run_onboarding_or_start, setup_logging, wire_notification_badge,
 )
 from infrastructure.common.audio.feedback import SoundFeedback
@@ -43,10 +50,23 @@ from infrastructure.linux.catalog.app_pinning import DesktopAppPinning
 from infrastructure.linux.catalog.installed_apps import XdgInstalledApps
 from domain.provisioning.provisioning import Provisioning
 from domain.provisioning.add_apps import AppAdder
+from domain.input_access.recipes import all_recipes as input_access_recipes
+from domain.input_access.requirement import GamepadAccess
+from domain.setup.gate import SetupGate
+from domain.setup.readiness import SetupReadiness
+from infrastructure.common.qt.overlays.setup_overlay import QtSetupView
+from infrastructure.linux.input.access import RULE_FILE, LinuxDeviceAccess
+from infrastructure.linux.system_facts import LinuxSystemFacts
 from infrastructure.linux.catalog.app_manager import AppManager
 from infrastructure.linux.proc import parent_pid, is_game_pid
 from infrastructure.linux.log.log_viewer_launcher import LogViewerLauncher
 from infrastructure.linux.power.power import SystemdPowerControl
+from infrastructure.linux.audio.qt_multimedia_env import apply_qt_multimedia_overrides
+from domain.system.silenced_power import SilencedPowerControl
+from infrastructure.linux.audio.outputs import PactlAudioOutputs
+from infrastructure.linux.audio.background import AudioWorker, BackgroundKasualOutput
+from domain.audio.kasual_output import KasualOutput
+from infrastructure.common.audio.patience import PollingPatience
 from infrastructure.linux.audio.volume import PactlVolumeControl
 from infrastructure.linux.display.brightness import select_brightness_control
 from infrastructure.linux.display.screensaver import (
@@ -54,34 +74,112 @@ from infrastructure.linux.display.screensaver import (
 )
 from infrastructure.common.qt.scheduler import QtScheduler
 from infrastructure.linux.hud.mangohud import MangoHudControl
+from domain.system.hud import hud_launch_env
 from infrastructure.linux.notifications.notifications import FreedesktopNotificationMonitor
+from infrastructure.linux.notifications.notifier import FreedesktopNotifier
 from infrastructure.linux.network.network_manager import NMNetworkControl, NMNetworkMonitor
 from domain.notifications.center import NotificationCenter
-from infrastructure.common.catalog.preferences import DesktopPowerPreference
+from infrastructure.common.catalog.preferences import (
+    DesktopBackgroundHintMemory, DesktopBorrowedOutputMemory, DesktopHudSetupMemory,
+    DesktopOutputPreference, DesktopPowerPreference,
+)
+from domain.shell.background_hint import BackgroundHint
+from domain.shell.desktop_control import DesktopControl
 from infrastructure.common.qt.i18n import install_translations
+from infrastructure.linux.session_restart import ExecSessionRestart
+from domain.display.launched_apps_screen import LaunchedAppsFollowKasual
+from domain.display.relaunch import AnnouncedRelaunch
 
 logger = logging.getLogger(__name__)
 
+_AUDIO_RETURNS_AFTER_RESUME_WITHIN_S = 15.0
 
-def _preflight_gate(app, gamepad, feedback, proceed) -> None:
-    """On GNOME, ensure the helper extension is active before any subsystem starts;
-    everywhere else there is nothing to gate."""
-    if detect_compositor() is not Compositor.GNOME:
-        proceed()
-        return
-    from domain.preflight.extension_gate import ExtensionGate
+
+def _extension_gate(app, gamepad, feedback) -> SetupGate | None:
+    """On GNOME the helper extension carries every window operation, so nothing
+    may start before it answers; everywhere else there is nothing to gate."""
+    if COMPOSITOR is not Compositor.GNOME:
+        return None
+    from domain.preflight.extension import ENABLE, LOG_OUT, HelperExtension
+    from domain.preflight.extension_recipes import all_recipes
     from infrastructure.gnome.extension import (
         GnomeExtensionActivator, GnomeExtensionProbe,
     )
-    from infrastructure.common.qt.overlays.preflight_overlay import QtPreflightView
+    from infrastructure.gnome.helper import EXTENSION_UUID
+    from infrastructure.gnome.session import GnomeSessionEnder
 
-    gate = ExtensionGate(
-        GnomeExtensionProbe(),
-        GnomeExtensionActivator(),
-        QtPreflightView(gamepad, feedback),
-        on_quit=app.quit,
+    activator = GnomeExtensionActivator()
+    return SetupGate(
+        SetupReadiness(
+            HelperExtension(GnomeExtensionProbe()),
+            LinuxSystemFacts(),
+            all_recipes(EXTENSION_UUID),
+        ),
+        QtSetupView(gamepad, feedback),
+        remedies={ENABLE: activator.enable,
+                  LOG_OUT: GnomeSessionEnder().log_out},
+        on_abort=app.quit,
     )
-    gate.ensure(proceed)
+
+
+def _layer_shell_gate(view) -> SetupGate | None:
+    """Without wlr-layer-shell nothing can place its own surfaces, and the
+    interface arrives scattered instead of anchored. Non-blocking: Qt binds its
+    shell integration at startup, so no card could turn green in this session —
+    it says what happened and what to do before the next one.
+
+    X11 and the offscreen platform place windows for their clients, and GNOME's
+    helper extension does the same job, so only the rest has anything to miss.
+    """
+    if LAYER_SHELL or COMPOSITOR is Compositor.GNOME:
+        return None
+    if QGuiApplication.platformName() != "wayland":
+        return None
+    from domain.preflight.layer_shell import LayerShellSurfaces
+    from domain.preflight.layer_shell_recipes import all_recipes
+    from infrastructure.linux.wayland.layer_shell_probe import QtLayerShellProbe
+
+    return SetupGate(
+        SetupReadiness(
+            LayerShellSurfaces(QtLayerShellProbe()),
+            LinuxSystemFacts(),
+            all_recipes(),
+        ),
+        view,
+    )
+
+
+def _hud_gate(view) -> SetupGate | None:
+    """Non-blocking, and asked at most once; a machine with no MangoHud config has
+    no HUD to lose and is never asked at all."""
+    from domain.preflight.hud import HudInSession
+    from domain.preflight.hud_recipes import all_recipes
+    from infrastructure.linux.hud.mangohud import MangoHudSession
+
+    memory = DesktopHudSetupMemory()
+    if not MangoHudControl().is_available() or memory.was_ever_shown():
+        return None
+    readiness = SetupReadiness(
+        HudInSession(MangoHudSession()), LinuxSystemFacts(), all_recipes())
+    if readiness.is_ready():
+        return None
+    memory.mark_shown()
+    return SetupGate(readiness, view)
+
+
+def _gamepad_access_gate(view) -> SetupGate:
+    """Reaching the pad through evdev needs device nodes a desktop session does
+    not open by default, and Kasual Desktop cannot tell that apart from having
+    no controller at all — so it says so instead of looking broken."""
+    rule_source = Path(__file__).parent.parent / "packaging" / RULE_FILE
+    return SetupGate(
+        SetupReadiness(
+            GamepadAccess(LinuxDeviceAccess()),
+            LinuxSystemFacts(),
+            input_access_recipes(str(rule_source)),
+        ),
+        view,
+    )
 
 
 def main() -> None:
@@ -93,8 +191,9 @@ def main() -> None:
     log_file = setup_logging(Path.home() / ".local" / "cache" / "kasual")
     version = get_version()
     logger.info("Running Kasual Desktop %s", version)
-    logger.info("Detected compositor: %s", detect_compositor().value)
+    logger.info("Detected compositor: %s", COMPOSITOR.value)
 
+    apply_qt_multimedia_overrides()
     app = QApplication(sys.argv)
     app.setApplicationName("Kasual Desktop")
     # Deterministic Wayland app_id: the wm_class the GNOME Helper extension pins by,
@@ -105,7 +204,11 @@ def main() -> None:
 
     CursorAutoHide(app)
 
-    guard = SingleInstanceGuard(log_file.parent)
+    # Before the single-instance check — its notification is a second instance's
+    # only visible string.
+    install_translations(app, str(Path(__file__).parent.parent / "locale"))
+
+    guard = SingleInstanceGuard(log_file.parent, FreedesktopNotifier())
     if not guard.try_lock():
         sys.exit(0)
     app.aboutToQuit.connect(guard.release)
@@ -114,10 +217,14 @@ def main() -> None:
     # substitute (see icons.install_fontawesome5). Before any icon is built.
     install_fontawesome5()
 
-    install_translations(app, str(Path(__file__).parent.parent / "locale"))
+    session_restart = ExecSessionRestart(app)
+    display_selection = follow_chosen_display(app, build_display_placement(
+        AnnouncedRelaunch(FreedesktopNotifier(), QtScheduler(), session_restart),
+        COMPOSITOR,
+    ))
 
     gamepad = GamepadWatcher()
-    screensaver_waker = build_screensaver_waker()
+    screensaver_waker = build_screensaver_waker(COMPOSITOR)
     gamepad.on_activity(screensaver_waker.poke)
     feedback = SoundFeedback()
 
@@ -135,7 +242,31 @@ def main() -> None:
     # persists the chosen ones through the same store as onboarding.
     app_adder = AppAdder(XdgInstalledApps(), provisioning)
 
-    def start_session() -> None:
+    gamepad_access_view = QtSetupView(gamepad, feedback)
+    gamepad_access = _gamepad_access_gate(gamepad_access_view)
+
+    def keep_launched_apps_on_kasual_screen(process_manager: AppManager) -> None:
+        primary = build_primary_display(COMPOSITOR)
+        if primary is None:
+            return
+        primary.reclaim()
+        launched_apps = LaunchedAppsFollowKasual(process_manager, primary, QtScheduler())
+        app.aboutToQuit.connect(launched_apps.release)
+
+    def sound_follows_kasual(audio_outputs: PactlAudioOutputs,
+                             worker: AudioWorker) -> BackgroundKasualOutput:
+        kasual_output = BackgroundKasualOutput(
+            KasualOutput(DesktopOutputPreference(), audio_outputs,
+                         DesktopBorrowedOutputMemory(),
+                         PollingPatience(within_s=_AUDIO_RETURNS_AFTER_RESUME_WITHIN_S)),
+            worker,
+        )
+        if not gamepad.is_connected():
+            kasual_output.give_back()
+        app.aboutToQuit.connect(kasual_output.give_back_before_exit)
+        return kasual_output
+
+    def start_session() -> DesktopControl:
         """Bring up the Desktop and controller from the (now-provisioned) apps.
 
         Deferred behind onboarding via a callback continuation rather than a
@@ -143,9 +274,9 @@ def main() -> None:
         apps = load_apps()
         logger.info("Loaded %d apps", len(apps))
 
-        wm = build_window_manager()
+        wm = build_window_manager(COMPOSITOR)
         # One PowerControl shared by the Desktop's action runner and the Application.
-        power = SystemdPowerControl()
+        power = SilencedPowerControl(SystemdPowerControl(), feedback, QtScheduler())
 
         # One persisted power-default preference is the single source of truth
         # shared by the Home Overlay's Power split-button and the top bar's
@@ -163,26 +294,38 @@ def main() -> None:
         notification_monitor.on_notification(notification_center.record)
 
         volume = PactlVolumeControl()
+        audio_worker = AudioWorker()
+        audio_outputs = PactlAudioOutputs(run_in_background=audio_worker.run)
+        kasual_output = sound_follows_kasual(audio_outputs, audio_worker)
         brightness = select_brightness_control()
+        # Ahead of the controller below: launching a game already needs it.
+        hud = MangoHudControl()
+        process_manager = AppManager()
+        keep_launched_apps_on_kasual_screen(process_manager)
         desktop = build_desktop(
             apps=apps, gamepad=gamepad, window_manager=wm,
-            wallpaper=build_system_wallpaper(), feedback=feedback,
+            wallpaper=build_system_wallpaper(COMPOSITOR), feedback=feedback,
             volume=volume, brightness=brightness,
             power=power, scheduler=QtScheduler(),
-            process_manager=AppManager(), notifications=notification_center,
+            process_manager=process_manager, notifications=notification_center,
             network_control=NMNetworkControl(),
+            displays=display_selection,
+            audio_outputs=audio_outputs,
+            audio_output=kasual_output,
             order_store=DesktopTileOrderStore(),
             settings_store=DesktopTileSettingsStore(),
             app_pinning=DesktopAppPinning(),
-            surface=build_desktop_surface(),
+            surface=build_desktop_surface(COMPOSITOR),
             parent_of=parent_pid,
             is_game_pid=is_game_pid,
             app_adder=app_adder,
+            setup_gate=gamepad_access,
+            setup_view=gamepad_access_view,
             power_preference=power_preference,
+            launch_env=lambda app: hud_launch_env(hud, app),
             deferred_hide_factory=lambda wm_, pm_, on_cede, on_hide:
                 DeferredHide(wm_, pm_, on_cede=on_cede, on_hide=on_hide,
-                             always_cede=detect_compositor()
-                             in (Compositor.HYPRLAND, Compositor.SWAY)),
+                             always_cede=COMPOSITOR in CEDE_BY_SINKING),
             deferred_show_factory=lambda wm_, pm_, on_show:
                 DeferredShow(wm_, pm_, on_show=on_show),
             cede_depth_factory=lambda wm_, pm_, on_sink:
@@ -212,16 +355,16 @@ def main() -> None:
         )
         tray = build_tray(
             feedback=feedback, desktop=desktop, log_viewer=log_viewer,
-            version=version, gamepad=gamepad, quit_fn=app.quit,
+            version=version, gamepad=gamepad, displays=display_selection,
+            quit_fn=app.quit, icon_for=build_tray_icon_source(),
         )
 
-        hud = MangoHudControl()
         controller = build_controller(
             gamepad=gamepad, desktop=desktop, tray=tray, wm=wm,
-            power=power, hud=hud,
+            power=power, hud=hud, sound=kasual_output,
         )
 
-        if os.environ.get("KD_TEST_API") == "1" or not is_packaged():
+        if test_api_enabled():
             from infrastructure.linux.introspection import ShellIntrospectionService
             # Parented to `app` for the same reason as the monitors above.
             ShellIntrospectionService(desktop, hud, parent=app)
@@ -233,16 +376,50 @@ def main() -> None:
         defer_start(app, notification_monitor)
         app.aboutToQuit.connect(controller.shutdown)
         app.aboutToQuit.connect(log_viewer.close)
+        return desktop
+
+    def start_session_then_offer_background_hint() -> None:
+        desktop = start_session()
+        BackgroundHint(
+            notifier=FreedesktopNotifier(),
+            memory=DesktopBackgroundHintMemory(),
+            desktop=desktop,
+            scheduler=QtScheduler(),
+        ).offer()
 
     def start() -> None:
         run_onboarding_or_start(
-            provisioning, provisioning_uc, gamepad, feedback, start_session)
+            provisioning, provisioning_uc, gamepad, feedback,
+            start_session_then_offer_background_hint)
 
-    _preflight_gate(app, gamepad, feedback, start)
+    def check_hud() -> None:
+        hud_setup = _hud_gate(gamepad_access_view)
+        if hud_setup is None:
+            start()
+        else:
+            hud_setup.ensure(start)
+
+    def check_gamepad_access() -> None:
+        gamepad_access.ensure(check_hud)
+
+    def check_layer_shell() -> None:
+        layer_shell = _layer_shell_gate(gamepad_access_view)
+        if layer_shell is None:
+            check_gamepad_access()
+        else:
+            layer_shell.ensure(check_gamepad_access)
+
+    extension = _extension_gate(app, gamepad, feedback)
+    if extension is None:
+        check_layer_shell()
+    else:
+        extension.ensure(check_layer_shell)
 
     QTimer.singleShot(0, feedback.init)
 
-    sys.exit(app.exec())
+    exit_code = app.exec()
+    session_restart.replace_process_if_requested()
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

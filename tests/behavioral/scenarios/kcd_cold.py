@@ -52,7 +52,7 @@ def _body(session: Session) -> None:
     window = game.wait_fullscreen()
     game.check_process(window)
     shell.check_kd_ceded(session.kd)
-    shell.check_home_menu_over_game(session.kd, session.pad)
+    shell.check_home_menu_over_game(session.kd, session.pad, game)
 
 
 SCENARIO = Scenario(
@@ -63,6 +63,7 @@ SCENARIO = Scenario(
     requires=(
         require.window_source(),
         require.command('steam'),
+        require.steam_devtools_client(),
         require.not_running(
             'steam',
             'Steam is not running (a cold start is the whole point, and only a Steam '

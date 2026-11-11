@@ -1,40 +1,75 @@
-"""The in-game performance HUD (MangoHud) — port plus the toggle's logic: whether
-it is offered, how it reads, and which way a press flips it."""
+"""The in-game performance HUD and its level slider."""
 
 from __future__ import annotations
 
-from typing import Protocol
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
+from typing import Protocol, Self
 
-from domain.menu.entry import TOGGLE_HUD
+from domain.catalog.app import App
+from domain.menu.entry import HUD_LEVEL
 from domain.menu.item import MenuItem
 from domain.shared.i18n import translate
 
+HUD_OFF = 0
+
+
+@dataclass(frozen=True)
+class HudLevel:
+    value:         int
+    most_detailed: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", max(HUD_OFF, min(self.most_detailed, self.value)))
+
+    @property
+    def is_off(self) -> bool:
+        return self.value == HUD_OFF
+
+    @property
+    def label(self) -> str:
+        if self.is_off:
+            return translate("Kasual Desktop", "Off")
+        return str(self.value)
+
+    def adjusted(self, delta: int) -> Self:
+        return replace(self, value=self.value + delta)
+
+    def at(self, value: int) -> Self:
+        return replace(self, value=value)
+
 
 class HudControl(Protocol):
-    """Port onto the performance HUD's availability and on/off state.
-    ``is_available`` gates the whole feature."""
-
     def is_available(self) -> bool: ...
-    def is_enabled(self) -> bool: ...
-    def enable(self) -> None: ...
-    def disable(self) -> None: ...
+    def level(self) -> HudLevel: ...
+    def set_level(self, level: HudLevel) -> None: ...
+
+    def launch_env(self) -> Mapping[str, str]:
+        """Environment a game must be started with for the HUD to attach to it;
+        empty where the HUD hooks running games by itself (RTSS)."""
+        return {}
+
+    def is_attached(self, pid: int | None) -> bool:
+        """Whether the HUD is loaded into *pid* — ``launch_env`` reaches only what
+        Kasual Desktop starts itself. True where the HUD hooks games by itself."""
+        return True
 
 
-def hud_menu_item(hud: HudControl, foreground_is_game: bool) -> MenuItem | None:
-    """The HUD toggle, or ``None`` when not offered (needs a configured HUD and a
-    game foreground). The label always names what a press will do."""
+def hud_launch_env(hud: HudControl, app: App) -> Mapping[str, str]:
+    """The HUD's :meth:`launch_env` for *app*, or nothing — only games get it, or
+    any app rendering through the same graphics API would get the HUD too."""
+    if not app.is_game or not hud.is_available():
+        return {}
+    return hud.launch_env()
+
+
+def hud_menu_item(hud: HudControl, foreground_is_game: bool,
+                  foreground_pid: int | None) -> MenuItem | None:
     if not hud.is_available():
         return None
     if not foreground_is_game:
         return None
-    if hud.is_enabled():
-        return MenuItem(translate("Kasual Desktop", "Disable HUD"), TOGGLE_HUD, "fa5s.eye-slash")
-    return MenuItem(translate("Kasual Desktop", "Enable HUD"), TOGGLE_HUD, "fa5s.eye")
-
-
-def toggle_hud(hud: HudControl) -> None:
-    """Flip the HUD: turn it off when on, on when off."""
-    if hud.is_enabled():
-        hud.disable()
-    else:
-        hud.enable()
+    if not hud.is_attached(foreground_pid):
+        return None
+    return MenuItem(translate("Kasual Desktop", "Performance overlay"), HUD_LEVEL,
+                    "fa5s.tachometer-alt")

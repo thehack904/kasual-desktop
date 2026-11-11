@@ -28,7 +28,7 @@ def main():
     from PyQt6.QtWidgets import QApplication
 
     from session import (
-        build_controller, build_tray, defer_start,
+        build_controller, build_tray, defer_start, follow_chosen_display,
         run_onboarding_or_start, setup_logging, wire_notification_badge,
     )
 
@@ -56,6 +56,9 @@ def main():
     from version import get_version
     version = get_version()
 
+    from infrastructure.common.qt.ui.screen_placement import RepositioningPlacement
+    display_selection = follow_chosen_display(app, RepositioningPlacement())
+
     # ── OS-specific adapters ────────────────────────────────────────────────
     from infrastructure.windows.input.gamepad_watcher import WindowsGamepadWatcher
     from infrastructure.windows.wm.window_manager import WindowsWindowManager
@@ -80,6 +83,9 @@ def main():
 
     # ── System adapters ─────────────────────────────────────────────────────
     from infrastructure.windows.power.power import WindowsPowerControl
+    from infrastructure.windows.audio.outputs import NoAudioOutputs
+    from domain.audio.kasual_output import KasualOutput
+    from infrastructure.common.audio.patience import PollingPatience
     from infrastructure.windows.audio.volume import WindowsVolumeControl
     from infrastructure.windows.display.brightness import WindowsBrightnessControl
     from infrastructure.windows.network.network import WindowsNetworkProbe, WindowsNetworkControl
@@ -95,7 +101,9 @@ def main():
     # read the same volume/brightness controls and power-default preference.
     volume = WindowsVolumeControl()
     brightness = WindowsBrightnessControl()
-    from infrastructure.common.catalog.preferences import DesktopPowerPreference
+    from infrastructure.common.catalog.preferences import (
+        DesktopBorrowedOutputMemory, DesktopOutputPreference, DesktopPowerPreference,
+    )
     power_preference = DesktopPowerPreference()
 
     # ── Catalog ─────────────────────────────────────────────────────────────
@@ -137,6 +145,9 @@ def main():
         notification_source = WindowsNotificationSource()
         notification_source.on_notification(notification_center.record)
 
+        kasual_output = KasualOutput(
+            DesktopOutputPreference(), NoAudioOutputs(), DesktopBorrowedOutputMemory(),
+            PollingPatience(within_s=0.0))
         desktop = build_desktop(
             apps=load_apps(),
             gamepad=gamepad,
@@ -150,6 +161,9 @@ def main():
             process_manager=process_manager,
             notifications=notification_center,
             network_control=WindowsNetworkControl(),
+            displays=display_selection,
+            audio_outputs=NoAudioOutputs(),
+            audio_output=kasual_output,
             order_store=DesktopTileOrderStore(),
             settings_store=DesktopTileSettingsStore(),
             app_pinning=WindowsAppPinning(),
@@ -162,8 +176,8 @@ def main():
             app_adder=app_adder,
             # Protocol apps (ms-settings) have no detectable window to wait on, so
             # hide on a short timer and let the surface's foreground monitor bring
-            # the Desktop back; the builder's wm/pm/apps/on_hide args don't apply.
-            deferred_hide_factory=lambda _wm, _pm, _on_hide:
+            # the Desktop back.
+            deferred_hide_factory=lambda _wm, _pm, _on_cede, _on_hide:
                 TimedLaunchHide(on_hide=surface.hide_for_launch),
             power_preference=power_preference,
         )
@@ -174,12 +188,12 @@ def main():
         log_window = LogWindow(log_file=str(log_file))
         tray = build_tray(
             feedback=feedback, desktop=desktop, log_viewer=log_window,
-            version=version, gamepad=gamepad, quit_fn=app.quit,
-            keep_alive=lambda o: _refs.__setitem__("about", o),
+            version=version, gamepad=gamepad, displays=display_selection,
+            quit_fn=app.quit, keep_alive=lambda o: _refs.__setitem__("about", o),
         )
         controller = build_controller(
             gamepad=gamepad, desktop=desktop, tray=tray, wm=wm,
-            power=power, hud=WindowsRtssHudControl(),
+            power=power, hud=WindowsRtssHudControl(), sound=kasual_output,
         )
         _refs.update(desktop=desktop, tray=tray, controller=controller)
 

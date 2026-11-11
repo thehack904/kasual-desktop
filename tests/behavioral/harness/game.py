@@ -11,6 +11,7 @@ that dies halfway still leaves no game on the screen for the next run.
 from __future__ import annotations
 
 import os
+import re
 import signal
 import subprocess
 import time
@@ -25,6 +26,41 @@ from tests.behavioral.harness.window_source import find
 
 if TYPE_CHECKING:
     from tests.behavioral.harness.session import Session
+
+
+HUD_ENV = {'MANGOHUD': '1'}
+
+
+def process_environ(pid: int) -> dict[str, str] | None:
+    """The environment *pid* was started with, or None when it cannot be read."""
+    try:
+        with open(f'/proc/{pid}/environ', 'rb') as environ:
+            raw = environ.read()
+    except OSError:
+        return None
+    entries = (e.decode('utf-8', 'replace') for e in raw.split(b'\0') if e)
+    return dict(e.split('=', 1) for e in entries if '=' in e)
+
+
+def carries_hud(environ: dict[str, str]) -> bool:
+    return ('DISABLE_MANGOHUD' not in environ
+            and environ.get('MANGOHUD', '') not in ('', '0'))
+
+
+_REMAP_BLINK_S = 2.0
+
+
+class _GoneForGood:
+    def __init__(self) -> None:
+        self._missing_since: float | None = None
+
+    def settled(self, missing: bool) -> bool:
+        if not missing:
+            self._missing_since = None
+            return False
+        if self._missing_since is None:
+            self._missing_since = time.monotonic()
+        return time.monotonic() - self._missing_since >= _REMAP_BLINK_S
 
 
 class SteamGame:
@@ -109,6 +145,50 @@ class SteamGame:
                f'"{window["title"]}" pid={window["pid"]}')
         return window
 
+    def check_still_on_screen(self, what: str) -> None:
+        """A surface that takes the *focus* takes the game with it — a fullscreen Wine
+        window minimizes itself on focus loss — and KD's own state cannot see that.
+        """
+        # No minimize concept outside KWin and Mutter; there the window simply goes.
+        def gone(event: dict) -> bool:
+            window = next(iter(self._fresh(event['stack'], fullscreen=True)), None)
+            return (window is None or window.get('minimized', False)
+                    or not window['focused'])
+
+        self._source.catch_up()
+        now = {'stack': self._source.last_stack()}
+        try:
+            event = now if gone(now) else self._source.wait_for(
+                gone, timeouts.STILL_ON_SCREEN,
+                f'nothing to happen to the game under the {what}')
+        except TimeoutError:
+            report(f'the game holds the screen under the {what}', 'PASS')
+            return
+        window = next(iter(self._fresh(event['stack'], fullscreen=True)), None)
+        report(f'the game holds the screen under the {what}', 'FAIL',
+               'its fullscreen window is gone' if window is None else
+               f'minimized={window.get("minimized")} focused={window["focused"]} — '
+               'did a KD surface take the focus from it?')
+
+    def expect_gone(self) -> None:
+        self._source.catch_up()
+        if self._fresh(self._source.last_stack()):
+            try:
+                self._source.wait_for(lambda e: not self._fresh(e['stack']),
+                                      timeouts.GAME_EXIT, 'the game to close')
+            except TimeoutError as exc:
+                report('the game closed when asked', 'FAIL', str(exc))
+                return
+        report('the game closed when asked', 'PASS', 'its windows are gone')
+
+        alive = [pid for pid in sorted(self._pids) if pid and not _await_exit(
+            lambda pid=pid: not os.path.isdir(f'/proc/{pid}'), timeouts.EXIT)]
+        if alive:
+            report('the game process ended', 'FAIL',
+                   f'still in /proc: {alive} — the window went, the process did not')
+        else:
+            report('the game process ended', 'PASS')
+
     def check_process(self, window: dict) -> None:
         pid = window['pid']
         if pid and os.path.isdir(f'/proc/{pid}'):
@@ -116,53 +196,66 @@ class SteamGame:
         else:
             report('game process alive', 'FAIL', f'pid {pid} not in /proc')
 
+    def check_hud_attached(self, window: dict) -> None:
+        environ = self._environ_or_warn(window['pid'], 'the HUD is loaded into the game')
+        if environ is None:
+            return
+        if carries_hud(environ):
+            report('the HUD is loaded into the game', 'PASS',
+                   f'MANGOHUD={environ["MANGOHUD"]} in the game\'s environment')
+            return
+        report('the HUD is loaded into the game', 'FAIL',
+               'no MANGOHUD in the game\'s environment — MangoHud\'s Vulkan layer '
+               'never loaded, so nothing can put the overlay on screen and KD does '
+               'not offer the toggle. Whoever started this game did not carry the '
+               'variable: a Steam client warmed up without it starts every game '
+               'without it.')
+
     def check_hud_not_overridden(self, window: dict) -> None:
         """MANGOHUD_CONFIG in the game's environment overrides MangoHud's config file —
         the very file KD's HUD toggle writes. Steam's per-game FPS limit sets it, and
         the toggle then flips a file nobody reads: it looks like it worked, and nothing
         happens on screen.
         """
-        pid = window['pid']
-        try:
-            with open(f'/proc/{pid}/environ', 'rb') as environ:
-                variables = environ.read().decode('utf-8', 'replace').split('\0')
-        except OSError as exc:
-            report('nothing overrides the HUD config', 'WARN',
-                   f'could not read the environment of pid {pid}: {exc}')
+        environ = self._environ_or_warn(window['pid'],
+                                        'nothing overrides the HUD config')
+        if environ is None:
             return
 
-        override = next((v for v in variables if v.startswith('MANGOHUD_CONFIG=')), None)
+        override = environ.get('MANGOHUD_CONFIG')
         if override is None:
             report('nothing overrides the HUD config', 'PASS',
                    'no MANGOHUD_CONFIG in the game\'s environment')
             return
         report('nothing overrides the HUD config', 'FAIL',
-               f'the game runs with {override} — it shadows MangoHud.conf, so KD\'s '
-               'toggle writes a file the game never reads (Steam\'s per-game FPS limit '
-               'sets this)')
+               f'the game runs with MANGOHUD_CONFIG={override} — it shadows '
+               'MangoHud.conf, so KD\'s toggle writes a file the game never reads '
+               '(Steam\'s per-game FPS limit sets this)')
+
+    def _environ_or_warn(self, pid: int, check: str) -> dict[str, str] | None:
+        environ = process_environ(pid)
+        if environ is None:
+            report(check, 'WARN', f'could not read the environment of pid {pid}')
+        return environ
 
     # ── a launcher that waits to be used ─────────────────────────────────────
 
-    def activate_launcher(self, what: str, max_presses: int = 3,
+    def activate_launcher(self, what: str, launcher: dict, max_presses: int = 3,
                           settle_s: float = 25.0) -> None:
-        """Press A until the launcher hands over to the game.
-
-        How many presses that takes belongs to the launcher, not to KD: its sidebar
-        may want one before the Play button does. Pressing stops the moment the game
-        goes fullscreen — further presses would land inside it.
-        """
         presses = 0
         next_press = 0.0
-        deadline = time.monotonic() + timeouts.GAME_FULLSCREEN
+        gone = _GoneForGood()
+        deadline = time.monotonic() + timeouts.HANDOVER
         with progress.waiting(f'the {what} handing over to the game',
-                              timeouts.GAME_FULLSCREEN) as bar:
+                              timeouts.HANDOVER) as bar:
             while time.monotonic() < deadline:
                 stack = self._source.last_stack()
-                if self._windows(stack, fullscreen=True):
+                launcher_up = self._launcher_up(stack, launcher)
+                game_has_the_screen = bool(self._windows(stack, fullscreen=True))
+                if game_has_the_screen or gone.settled(not launcher_up):
                     report(f'"Play" activated on the {what}', 'PASS',
                            f'{presses} press(es) of A')
                     return
-                launcher_up = bool(self._windows(stack, fullscreen=False))
                 if launcher_up and presses < max_presses and time.monotonic() >= next_press:
                     self._pad.confirm()
                     presses += 1
@@ -172,8 +265,12 @@ class SteamGame:
                 time.sleep(0.2)
 
         report(f'"Play" activated on the {what}', 'FAIL',
-               f'{presses} press(es) of A, the game never went fullscreen')
+               f'{presses} press(es) of A, the {what} is still on the screen')
         raise ScenarioAborted(f'the {what} never handed over to the game')
+
+    def _launcher_up(self, stack: list[dict], launcher: dict) -> bool:
+        return any(w['pid'] == launcher['pid']
+                   for w in find(stack, app_id=self.app_id))
 
     # ── teardown ─────────────────────────────────────────────────────────────
 
@@ -193,34 +290,95 @@ class SteamGame:
 
 
 def warm_up_steam() -> None:
-    """Start Steam and wait for its client, so a tile's steam://rungameid runs the game.
+    """Start Steam and wait for it to log in, so a tile's steam://rungameid runs the game.
 
     A cold Steam started by that URL comes up in Big Picture and swallows the request;
     an already-running one runs the game. `-silent` keeps it off the screen, so KD holds
     the Home view while it warms.
+
+    The client is given the HUD's environment because it, not the `steam://` forwarder
+    KD spawns, is what starts the game.
+
+    Waiting on the *logon* rather than on a process is what makes the run mean what it
+    says: steamwebhelper is up within a second, while the client is still on its login
+    screen queueing the request for another twenty.
     """
-    if not _steam_gone():
-        report('Steam warmed up in the background', 'PASS', 'already running')
-        return
-    subprocess.Popen(['steam', '-silent'], stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL, start_new_session=True)
+    already_running = not _steam_gone()
+    logon = _ConnectionLog(running=already_running)
+    if already_running:
+        _check_client_carries_hud()
+    else:
+        subprocess.Popen(['steam', '-silent'], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True,
+                         env={**os.environ, **HUD_ENV})
     deadline = time.monotonic() + timeouts.STEAM_UI
     with progress.waiting('Steam warming up in the background', timeouts.STEAM_UI) as bar:
         while time.monotonic() < deadline:
-            if _steam_client_up():
+            if logon.logged_on():
                 report('Steam warmed up in the background', 'PASS',
-                       'client is up, off the screen')
+                       'logged in, off the screen')
                 return
             bar.tick()
             QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 50)
             time.sleep(0.5)
     report('Steam warmed up in the background', 'WARN',
-           'the client never reported up — launching the tile anyway')
+           'the client never logged in — launching the tile anyway')
 
 
-def _steam_client_up() -> bool:
-    return subprocess.run(['pgrep', '-x', 'steamwebhelper'],
-                          stdout=subprocess.DEVNULL).returncode == 0
+def expect_steam_gone() -> None:
+    if _await_exit(_steam_gone, timeouts.EXIT):
+        report('Steam ended when asked', 'PASS', 'no steam or steamwebhelper left')
+        return
+    left = {name: _pids_of(name) for name in STEAM_PROCESSES if _pids_of(name)}
+    report('Steam ended when asked', 'FAIL', f'still running: {left}')
+
+
+def _check_client_carries_hud() -> None:
+    pids = _pids_of('steam')
+    environ = process_environ(pids[0]) if pids else None
+    if environ is None or carries_hud(environ):
+        return
+    report('the warm Steam client carries the HUD environment', 'WARN',
+           'this client was started before the run, without MANGOHUD — the games it '
+           'starts load no MangoHud layer, so the HUD checks below will fail. Shut '
+           'Steam down and run again to have the harness start it.')
+
+
+class _ConnectionLog:
+    """Steam's own record of the logon — the one readout of "the client is ready" that
+    neither the UI language nor `-silent` can take away.
+
+    A client this run starts is read from what it appends from here on, so a logon left
+    behind by an earlier run cannot pass for this one's.
+    """
+
+    PATH  = os.path.expanduser('~/.steam/steam/logs/connection_log.txt')
+    STATE = re.compile(r'^\[[^]]*\] \[([^,\]]+)')
+    TAIL  = 64 * 1024
+
+    def __init__(self, *, running: bool = False) -> None:
+        size = self._size()
+        self._offset = max(0, size - self.TAIL) if running else size
+
+    def logged_on(self) -> bool:
+        if _steam_gone():
+            return False
+        if self._size() < self._offset:      # Steam truncated the log on start-up
+            self._offset = 0
+        try:
+            with open(self.PATH, 'rb') as log:
+                log.seek(self._offset)
+                appended = log.read().decode('utf-8', 'replace')
+        except OSError:
+            return False
+        states = [self.STATE.match(line) for line in appended.splitlines()]
+        return next((m.group(1) for m in reversed(states) if m), '') == 'Logged On'
+
+    def _size(self) -> int:
+        try:
+            return os.path.getsize(self.PATH)
+        except OSError:
+            return 0
 
 
 def _await_exit(is_gone: Callable[[], bool], timeout_s: float) -> bool:
@@ -243,23 +401,29 @@ def _terminate(pid: int) -> bool:
     return False
 
 
+# steamwebhelper owns Big Picture's window and its debug port, and outlives the client.
+STEAM_PROCESSES = ('steam', 'steamwebhelper')
+
+
 def _steam_gone() -> bool:
-    return subprocess.run(['pgrep', '-x', 'steam'],
-                          stdout=subprocess.DEVNULL).returncode != 0
+    return not any(_pids_of(name) for name in STEAM_PROCESSES)
 
 
 def _shut_down_steam() -> None:
-    """`steam -shutdown` asks politely, and Big Picture is free to ignore it — it
-    quits from its own power menu. The teardown is not the place to drive that menu,
-    so an ignored request is escalated."""
+    """`steam -shutdown` on a dead Steam starts one: /usr/bin/steam execs the client
+    whatever the argument."""
+    if _steam_gone():
+        print('  steam already gone', flush=True)
+        return
     subprocess.run(['steam', '-shutdown'], stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL, check=False)
     if _await_exit(_steam_gone, timeouts.EXIT):
         print('  steam shut down', flush=True)
         return
 
-    for pid in _pids_of('steam'):
-        _terminate(pid)
+    for name in STEAM_PROCESSES:
+        for pid in _pids_of(name):
+            _terminate(pid)
     print(f'  steam {"killed" if _steam_gone() else "still running"}', flush=True)
 
 

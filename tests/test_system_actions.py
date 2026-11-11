@@ -6,8 +6,11 @@ gated behind a confirmation while immediate ones are not.
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from domain.system.actions import ActionDeps
 from domain.system.runner import ActionRunner
+from domain.system.silenced_power import SilencedPowerControl
 
 
 def _deps():
@@ -24,6 +27,11 @@ class TestDispatch:
         ActionRunner(deps, _auto_confirm).run("hide_desktop")
         deps.desktop.pause.assert_called_once()
 
+    def test_gamepad_access_opens_the_setup_card(self, qapp):
+        deps = _deps()
+        ActionRunner(deps, _auto_confirm).run("gamepad_access")
+        deps.desktop.open_gamepad_access_check.assert_called_once()
+
     def test_sleep_suspends(self, qapp):
         deps = _deps()
         ActionRunner(deps, _auto_confirm).run("sleep")
@@ -38,6 +46,26 @@ class TestDispatch:
         deps = _deps()
         ActionRunner(deps, _auto_confirm).run("shutdown")
         deps.power.poweroff.assert_called_once()
+
+
+class TestPowerActionsSilenceCuesFirst:
+    @pytest.mark.parametrize("action_key, verb", [
+        ("sleep", "suspend"), ("restart", "reboot"), ("shutdown", "poweroff"),
+    ])
+    def test_systemctl_runs_only_after_silencing_and_the_deferral(self, action_key, verb):
+        calls = MagicMock()
+        deferred = []
+        power = SilencedPowerControl(
+            calls.power, calls.feedback,
+            MagicMock(call_later=lambda _delay, callback: deferred.append(callback)))
+
+        ActionRunner(ActionDeps(desktop=MagicMock(), power=power), _auto_confirm).run(action_key)
+        silenced_before_deferral = [name for name, _, _ in calls.mock_calls]
+        for callback in deferred:
+            callback()
+
+        assert silenced_before_deferral == ["feedback.silence"]
+        assert [name for name, _, _ in calls.mock_calls] == ["feedback.silence", f"power.{verb}"]
 
 
 class TestConfirmationGating:

@@ -13,11 +13,13 @@ import pytest
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
 
+from domain.audio.output import AudioOutput
 from domain.catalog.target import AppTarget
 from domain.input.vocabulary import Event
 from domain.menu.entry import POWER, RETURN_TO_APP, RETURN_TO_DESKTOP
-from domain.system.actions import NETWORK
+from domain.system.actions import GAMEPAD_ACCESS, NETWORK
 from domain.system.brightness import Brightness
+from domain.system.hud import HUD_OFF, HudLevel
 from domain.system.volume import Volume
 from infrastructure.common.qt.desktop.home_surface import HomeSurface
 
@@ -58,6 +60,21 @@ class FakeBrightness:
 
     def is_controllable(self):
         return self._controllable
+
+
+class FakeAudioOutputs:
+    def __init__(self, outputs=(), active=None):
+        self._outputs = list(outputs)
+        self._active = active
+
+    def available(self):
+        return self._outputs
+
+    def active(self):
+        return self._active
+
+    def activate(self, output_id):
+        self._active = output_id
 
 
 class FakePowerMenu:
@@ -104,19 +121,22 @@ class Spy:
         self.hints.append(False)
 
 
-def _surface(qapp, gamepad=None, spy=None):
+def _surface(qapp, gamepad=None, spy=None, audio_outputs=None,
+             gamepad_access_needed=lambda: False):
     from infrastructure.common.qt.overlays.home_header import HomeHeader
     from infrastructure.common.qt.overlays.home_menu_content import CARD_WIDTH
     spy = spy or Spy()
     header = HomeHeader(spy.on_header_activate, CARD_WIDTH)
     surface = HomeSurface(
         gamepad or MagicMock(), MagicMock(),
-        FakeVolume(), FakeBrightness(), FakePowerMenu(), header,
+        FakeVolume(), FakeBrightness(), FakePowerMenu(),
+        audio_outputs or FakeAudioOutputs(), header,
         on_action=spy.on_action,
         on_power_chooser=spy.on_power_chooser,
         begin_hints=spy.begin_hints,
         set_hints=spy.set_hints,
         end_hints=spy.end_hints,
+        gamepad_access_needed=gamepad_access_needed,
     )
     return surface, spy
 
@@ -241,7 +261,7 @@ class TestDispatch:
                 break
             content.handle_pad(Event.UP)
         zone = content.zones[content.active]
-        zone.index = 0   # Network — first of the header's nav items
+        zone.index = 0   # Configuration — first of the header's nav items
         content.sync_hints()
         assert spy.pushed_hints[-1] is nav_hints.OVERLAY_HEADER
 
@@ -364,17 +384,17 @@ class TestHeaderAsTopBar:
         nav.handle_pad(Event.SELECT)
         assert activated == [POWER]
 
-    def test_select_in_header_opens_network(self, qapp):
+    def test_right_from_power_wraps_to_configuration(self, qapp):
         nav, _header, activated = self._nav_with_header()
-        nav.handle_pad(Event.UP)         # into the header (Power, index 2)
-        nav.handle_pad(Event.RIGHT)      # Power → Network (wraps to index 0)
+        nav.handle_pad(Event.UP)
+        nav.handle_pad(Event.RIGHT)
         nav.handle_pad(Event.SELECT)
-        assert activated == ["network"]
+        assert activated == ["configuration"]
 
     def test_left_then_select_opens_notifications(self, qapp):
         nav, _header, activated = self._nav_with_header()
-        nav.handle_pad(Event.UP)         # into the header (Power, index 2)
-        nav.handle_pad(Event.LEFT)       # Power → Notifications (index 1)
+        nav.handle_pad(Event.UP)         # into the header (Power, index 3)
+        nav.handle_pad(Event.LEFT)       # Power → Notifications (index 2)
         nav.handle_pad(Event.SELECT)
         assert activated == ["notifications"]
 
@@ -438,6 +458,46 @@ class TestOnDemand:
         surface._content.handle_pad(Event.CANCEL)
         assert cancelled == [1]
         assert surface.is_showing() is False
+
+    def _focus_hud_slider(self, surface, hud):
+        from domain.menu.home import SectionKind
+        surface.show_for_context(
+            foreground=AppTarget(index=0, app_id="game", name="Game"), foreground_is_game=True,
+            hud=hud, on_action=lambda i: None, on_cancel=None, set_hints=lambda h: None,
+        )
+        content = surface._content
+        content.active = next(zi for zi, z in enumerate(content.zones)
+                              if z.kind == SectionKind.HUD)
+        return content
+
+    def test_hud_slider_steps_the_level_and_keeps_the_menu_open(self, qapp):
+        surface, _ = _surface(qapp)
+        hud = FakeHud(available=True, level=2)
+        content = self._focus_hud_slider(surface, hud)
+        content.handle_pad(Event.RIGHT)
+        assert hud.current.value == 3
+        content.handle_pad(Event.LEFT)
+        content.handle_pad(Event.LEFT)
+        content.handle_pad(Event.LEFT)
+        assert hud.current.value == HUD_OFF
+        assert surface.is_showing() is True
+
+    def test_hud_slider_stops_at_off(self, qapp):
+        surface, _ = _surface(qapp)
+        hud = FakeHud(available=True, level=HUD_OFF)
+        content = self._focus_hud_slider(surface, hud)
+        content.handle_pad(Event.LEFT)
+        assert hud.current.value == HUD_OFF
+
+    def test_select_on_hud_slider_dispatches_nothing(self, qapp):
+        surface, _ = _surface(qapp)
+        dispatched = []
+        hud = FakeHud(available=True, level=2)
+        content = self._focus_hud_slider(surface, hud)
+        surface._content._on_action = dispatched.append
+        content.handle_pad(Event.SELECT)
+        assert dispatched == []
+        assert surface.is_showing() is True
 
     def test_minimized_focuses_hide_desktop(self, qapp):
         # Over a minimized Kasual the surface opens focused on "Minimize"'s
@@ -577,10 +637,14 @@ class TestOutsideClick:
 
 
 class FakeHud:
-    def is_available(self): return False
-    def is_enabled(self): return True
-    def enable(self): ...
-    def disable(self): ...
+    def __init__(self, available=False, level=2):
+        self._available = available
+        self.current = HudLevel(level, 4)
+
+    def is_available(self): return self._available
+    def is_attached(self, pid): return True
+    def level(self): return self.current
+    def set_level(self, level): self.current = level
 
 
 class TestStatusHeader:
@@ -626,3 +690,118 @@ class TestGrabHandle:
         assert header._handle._prominent is True
         header._handle.set_prominent(False)
         assert header._handle._prominent is False
+
+
+class TestGrabHandleDocking:
+    """The pull rides the bottom edge of whatever the pill currently is."""
+
+    def _laid_out(self, qapp):
+        surface, _ = _surface(qapp)
+        surface.setFixedWidth(1920)
+        surface.show()
+        qapp.processEvents()
+        return surface, surface.header.grab_handle()
+
+    def _finish_morph(self, surface, qapp):
+        from infrastructure.common.qt.desktop.home_surface import MORPH_MS
+        surface._anim.setCurrentTime(MORPH_MS)
+        qapp.processEvents()
+
+    def test_collapsed_handle_sits_on_the_header(self, qapp):
+        surface, handle = self._laid_out(qapp)
+        assert handle.parentWidget() is surface.header
+        assert surface.header.rect().contains(handle.geometry())
+
+    def test_expanded_handle_rides_the_panel_bottom(self, qapp):
+        surface, handle = self._laid_out(qapp)
+        surface.expand()
+        self._finish_morph(surface, qapp)
+        assert handle.parentWidget() is surface
+        panel = surface._panel.geometry()
+        assert panel.contains(handle.geometry())
+        assert panel.bottom() - handle.geometry().bottom() < 10
+
+    def test_handle_returns_to_the_header_only_once_the_morph_ends(self, qapp):
+        surface, handle = self._laid_out(qapp)
+        surface.expand()
+        self._finish_morph(surface, qapp)
+        surface.collapse()
+        assert handle.parentWidget() is surface   # still riding the closing panel
+        surface._settle_collapsed()
+        assert handle.parentWidget() is surface.header
+
+    def test_reopening_inside_the_morph_keeps_the_pill_fused(self, qapp):
+        surface, handle = self._laid_out(qapp)
+        surface.expand()
+        surface.collapse()
+        surface.expand()
+        surface._settle_collapsed()   # the stale timer the collapse left behind
+        assert handle.parentWidget() is surface
+
+    def test_on_demand_open_and_close_move_the_handle(self, qapp):
+        surface, handle = self._laid_out(qapp)
+        surface.show_for_context(
+            foreground=None, foreground_is_game=False, hud=FakeHud(),
+            on_action=lambda i: None, on_cancel=None, set_hints=lambda h: None)
+        qapp.processEvents()
+        assert handle.parentWidget() is surface
+        surface.hide_overlay()
+        assert handle.parentWidget() is surface.header
+
+    def test_collapse_immediately_takes_the_handle_back(self, qapp):
+        surface, handle = self._laid_out(qapp)
+        surface.expand()
+        self._finish_morph(surface, qapp)
+        surface.collapse_immediately()
+        assert handle.parentWidget() is surface.header
+        assert surface.header.rect().contains(handle.geometry())
+
+    def test_handle_keeps_the_accent_until_it_lands(self, qapp):
+        # The accent tracks the fused pill, not the close request: the handle is
+        # still riding the shrinking panel while the morph runs.
+        surface, handle = self._laid_out(qapp)
+        surface.expand()
+        assert handle._focused is True
+        surface.collapse()
+        assert handle._focused is True
+        surface._settle_collapsed()
+        assert handle._focused is False
+
+
+class TestActiveAudioOutput:
+    SPEAKERS = AudioOutput("usb:speaker", "Speakers – USB Audio")
+
+    def _output_name(self, qapp, qtbot, audio_outputs):
+        surface, _ = _surface(qapp, audio_outputs=audio_outputs)
+        surface.expand()
+        label = surface._content._output_name
+        qtbot.waitUntil(lambda: surface._content._last_output_name is not None
+                        or audio_outputs.active() is None, timeout=1000)
+        qapp.processEvents()
+        return label
+
+    def test_names_the_active_output_under_the_volume_slider(self, qapp, qtbot):
+        label = self._output_name(
+            qapp, qtbot, FakeAudioOutputs([self.SPEAKERS], active="usb:speaker"))
+        assert label.text() == "Speakers – USB Audio"
+        assert not label.isHidden()
+
+    def test_hides_the_name_when_no_output_is_known(self, qapp, qtbot):
+        label = self._output_name(qapp, qtbot, FakeAudioOutputs())
+        assert label.isHidden()
+
+
+class TestGamepadAccessCard:
+    def _offered(self, surface):
+        surface.expand()
+        offered = any(item.action == GAMEPAD_ACCESS
+                      for zone in surface._content.zones for item in zone.items)
+        surface.collapse()
+        return offered
+
+    def test_follows_the_access_state_on_every_open(self, qapp):
+        missing = [True]
+        surface, _ = _surface(qapp, gamepad_access_needed=lambda: missing[0])
+        assert self._offered(surface)
+        missing[0] = False
+        assert not self._offered(surface)

@@ -6,19 +6,31 @@ from typing import Protocol
 TILES  = 'tiles'
 HEADER = 'header'
 
+# The tile bar's sections, in display order.
+TILE_APP    = 'app'
+TILE_ADD    = 'add'
+TILE_WINDOW = 'window'
+
 
 @dataclass(frozen=True)
 class TileSnapshot:
-    index:  int
-    app_id: str
-    name:   str
+    index:   int
+    app_id:  str
+    name:    str
+    running: bool = False
 
 
 @dataclass(frozen=True)
 class FocusSnapshot:
-    """Where the pad's cursor sits; ``app_id`` is set only on an app tile."""
+    """Where the pad's cursor sits.
+
+    ``tile_index`` and ``app_id`` are None outside the app section; ``cursor`` and
+    ``kind`` place the cursor across the whole bar.
+    """
 
     zone:       str
+    cursor:     int | None = None
+    kind:       str | None = None
     tile_index: int | None = None
     app_id:     str | None = None
 
@@ -34,9 +46,7 @@ class MenuItemSnapshot:
 class MenuSectionSnapshot:
     """A zone of the Home menu — the sliders, the action cards — in zone order.
 
-    ``columns`` is what makes the zone navigable from outside: a one-column zone moves
-    under up/down and ignores left/right, and a caller that cannot tell the difference
-    can only press buttons and hope.
+    ``columns`` says how it navigates: a one-column zone ignores left/right.
     """
 
     kind:    str
@@ -46,30 +56,27 @@ class MenuSectionSnapshot:
 
 @dataclass(frozen=True)
 class HomeMenuSnapshot:
-    """What the Home menu offers and where its cursor sits.
-
-    Closed, it offers nothing: the sections are composed for the context the menu is
-    opened in, so there is no menu to describe until there is one on screen.
-    """
+    """What the Home menu offers and where its cursor sits. Closed it offers
+    nothing: the sections are composed for the context it is opened in."""
 
     open:     bool
     sections: tuple[MenuSectionSnapshot, ...] = ()
 
-    @property
-    def focused(self) -> MenuItemSnapshot | None:
-        for section in self.sections:
-            for item in section.items:
-                if item.focused:
-                    return item
-        return None
+
+@dataclass(frozen=True)
+class TileMenuSnapshot:
+    """The popover a tile opens on X. What it offers depends on the tile's state —
+    a running app can be restored or closed, a stopped one only launched."""
+
+    open:  bool
+    items: tuple[MenuItemSnapshot, ...] = ()
 
 
 @dataclass(frozen=True)
 class ConfirmSnapshot:
     """The confirmation a destructive pick is gated by — closing an app, unpinning.
 
-    ``confirm_focused`` is which button a press of A would hit; without it a caller can
-    only press and find out.
+    ``confirm_focused`` is which button a press of A would hit.
     """
 
     open:            bool
@@ -82,14 +89,13 @@ class ShellSnapshot:
     """The Home view (tiles, focus), the Home menu, and which shell surfaces are
     on screen.
 
-    Three states tell apart the ways the Desktop leaves the foreground, which
-    decide whether a launcher or splash of the app is reachable or buried:
-    ``desktop_visible`` — in front and owning input; ``desktop_mapped`` — still
-    on screen though ceded (it would cover an app's ordinary window unless it
-    also sank); ``desktop_sunk`` — ceded *and* under those windows.
+    Three states tell apart the ways the Desktop leaves the foreground:
+    ``desktop_visible`` — in front and owning input; ``desktop_mapped`` — ceded but
+    still on screen, so it covers an app's ordinary window unless it also sank;
+    ``desktop_sunk`` — ceded and under those windows.
 
-    ``foreground`` is the app the shell still *believes* it launched: it outlives the
-    app's process, and the shell returns to the Home screen the moment it finds out.
+    ``foreground`` is the app the shell believes it launched, which outlives the
+    app's process.
     """
 
     desktop_visible:    bool
@@ -98,6 +104,7 @@ class ShellSnapshot:
     home_header_mapped: bool
     hint_bar_mapped:    bool
     home_menu:          HomeMenuSnapshot
+    tile_menu:          TileMenuSnapshot
     confirm:            ConfirmSnapshot
     focus:              FocusSnapshot
     tiles:              tuple[TileSnapshot, ...]

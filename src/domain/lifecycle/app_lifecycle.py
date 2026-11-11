@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
+from domain.catalog.app import App
 from domain.catalog.live_catalog import LiveCatalog
 from domain.catalog.window_rules import is_app_running
 from domain.input.vocabulary import Trigger
@@ -12,10 +13,8 @@ from domain.shell.foreground import ForegroundState
 from domain.catalog.target import AppTarget, Target, WindowTarget
 from domain.input.pad_control import PadControl
 from domain.lifecycle.app_control import AppControl
-from domain.lifecycle.cede_depth import CedeDepth
 from domain.lifecycle.foreground_inspector import ForegroundInspector
-from domain.lifecycle.launch_hide import LaunchHide
-from domain.lifecycle.launch_show import LaunchShow
+from domain.lifecycle.launch_transitions import LaunchTransitions
 from domain.menu.entry import CLOSE, LAUNCH, RESTORE
 from domain.menu.item import MenuItem
 from domain.lifecycle.process_manager import ProcessManager
@@ -29,15 +28,12 @@ from domain.shell.desktop_view import DesktopView
 
 logger = logging.getLogger(__name__)
 
-# A Steam forwarder exits the instant it hands the game to an already-running Steam;
-# the game's own window follows seconds later. This is how long to wait for that window
-# before calling the launch failed and taking the screen back.
-_FORWARDER_LAUNCH_TIMEOUT_MS = 30_000
+# A Steam forwarder exits long before the game's window maps; the Desktop stays
+# ceded this long so Steam's own progress keeps the screen.
+_FORWARDER_CEDE_GRACE_MS = 120_000
 
 
 class AppLifecycle(AppControl):
-    """Coordinates launching, restoring, closing and exit-handling of apps."""
-
     def __init__(
         self,
         view: DesktopView,
@@ -46,9 +42,7 @@ class AppLifecycle(AppControl):
         app_manager: ProcessManager,
         apps: LiveCatalog,
         foreground: ForegroundState,
-        deferred_hide: LaunchHide,
-        deferred_show: LaunchShow,
-        cede_depth: CedeDepth,
+        transitions: LaunchTransitions,
         tilebar: TileBarView,
         pad_handler: Callable[[str], None],
         scheduler: Scheduler,
@@ -56,6 +50,7 @@ class AppLifecycle(AppControl):
         prompts: Prompts,
         inspector: ForegroundInspector,
         is_paused: Callable[[], bool] = lambda: False,
+        launch_env: Callable[[App], Mapping[str, str]] = lambda _app: {},
     ):
         self._view          = view
         self._gamepad       = gamepad
@@ -64,9 +59,7 @@ class AppLifecycle(AppControl):
         self._arranger      = WindowArranger(window_manager, app_manager)
         self._apps          = apps
         self._foreground    = foreground
-        self._deferred_hide = deferred_hide
-        self._deferred_show = deferred_show
-        self._cede_depth    = cede_depth
+        self._transitions   = transitions
         self._tilebar       = tilebar
         self._pad_handler   = pad_handler
         self._scheduler     = scheduler
@@ -74,13 +67,24 @@ class AppLifecycle(AppControl):
         self._prompts       = prompts
         self._inspector     = inspector
         self._is_paused     = is_paused
+        self._launch_env    = launch_env
         self._pending_return: str | None = None
+        self._awaited_launch: str | None = None
+
+    def _app_by_id(self, app_id: str) -> App | None:
+        return next((a for a in self._apps if a.id == app_id), None)
+
+    def _index_by_id(self, app_id: str) -> int | None:
+        return next((i for i, a in enumerate(self._apps) if a.id == app_id), None)
 
     def current_app(self) -> Target | None:
         return self._inspector.current_app()
 
     def foreground_pid(self) -> int | None:
         return self._inspector.foreground_pid()
+
+    def foreground_game_pid(self) -> int | None:
+        return self._inspector.foreground_game_pid()
 
     def foreground_is_game(self) -> bool:
         return self._inspector.foreground_is_game()
@@ -99,6 +103,8 @@ class AppLifecycle(AppControl):
         # would activate a window that's about to disappear.
         if isinstance(target, AppTarget) and self._tilebar.is_closing(target.index):
             return
+        # Whatever is picked now supersedes a launch still waiting for its window.
+        self._awaited_launch = None
         self._foreground.set(target)
         if not isinstance(target, AppTarget):
             self.restore_app(target)
@@ -118,11 +124,12 @@ class AppLifecycle(AppControl):
             self._gamepad.pop_handler(self._pad_handler)
             # launch() reports immediate failure synchronously (the Desktop is
             # already reactivated); only arm the deferred hide on a real launch.
-            if self._app_manager.launch(app.id, app.command, app.args, app.env):
+            env = {**self._launch_env(app), **app.env}   # app.env wins
+            if self._app_manager.launch(app.id, app.command, app.args, env):
                 # Defer the hide until the window maps, so no DE-desktop flash.
-                self._deferred_hide.arm(app)
-                self._deferred_show.arm(app)
-                self._cede_depth.arm(app)
+                self._transitions.hide.arm(app)
+                self._transitions.show.arm(app)
+                self._transitions.cede_depth.arm(app)
 
     def dispatch_tile_action(self, item: MenuItem) -> None:
         if item.action in (LAUNCH, RESTORE):
@@ -136,8 +143,8 @@ class AppLifecycle(AppControl):
             app = self._apps[target.index]
             self._gamepad.set_app_btn_mode_trigger(app.recall_menu_trigger)
             self._arranger.raise_app(app)
-            self._deferred_show.arm(app)
-            self._cede_depth.arm(app)
+            self._transitions.show.arm(app)
+            self._transitions.cede_depth.arm(app)
         else:
             self._gamepad.set_app_btn_mode_trigger(target.trigger)
             self._wm.activate_window(target.window_id)
@@ -165,7 +172,6 @@ class AppLifecycle(AppControl):
         )
 
     def arrange_windows(self, activate_pid: int | None = None) -> None:
-        """Activate windows for activate_pid and minimize all other running apps."""
         self._arranger.arrange(activate_pid)
 
     # ── Closing an application ──────────────────────────────────────────────
@@ -220,7 +226,7 @@ class AppLifecycle(AppControl):
     def on_app_launch_failed(self, app_id: str, error: str) -> None:
         logger.warning("Application %s failed to launch: %s", app_id, error)
         # Keep the Desktop up for the error dialog.
-        self._deferred_hide.cancel()
+        self._transitions.hide.cancel()
         # The optimistic foreground set in on_tile_activated never started, so
         # clear it or BTN_MODE would target the never-launched app.
         self._foreground.clear_if_app(app_id)
@@ -236,13 +242,13 @@ class AppLifecycle(AppControl):
             # KD's chrome over the game that maps a moment later.
             logger.info("%s forwarder handed off; awaiting the game's window", app_id)
             self._scheduler.call_later(
-                _FORWARDER_LAUNCH_TIMEOUT_MS,
-                lambda: self._forwarder_launch_timed_out(app_id))
+                _FORWARDER_CEDE_GRACE_MS,
+                lambda: self._forwarder_cede_grace_elapsed(app_id))
             return
 
         logger.info("Application %s finished – returning to desktop", app_id)
         # Don't hide onto a closed app.
-        self._deferred_hide.cancel()
+        self._transitions.hide.cancel()
         self._view.close_active_dialog()
         self._tilebar.refresh_status()
         self._wm.refresh_now()
@@ -267,8 +273,8 @@ class AppLifecycle(AppControl):
 
     def _return_from(self, app_id: str) -> None:
         self._pending_return = None
-        self._deferred_show.cancel()
-        self._cede_depth.cancel()
+        self._transitions.show.cancel()
+        self._transitions.cede_depth.cancel()
         self._foreground.clear_if_app(app_id)
         if not self._view.is_visible():
             self.reactivate_desktop()
@@ -277,7 +283,7 @@ class AppLifecycle(AppControl):
         self._scheduler.call_later(1000, self._gamepad.refresh)
 
     def _still_windowed(self, app_id: str) -> bool:
-        app = next((a for a in self._apps if a.id == app_id), None)
+        app = self._app_by_id(app_id)
         if app is None:
             return False
         return any(w.matches_app(app) for w in self._wm.cached_windows())
@@ -285,20 +291,59 @@ class AppLifecycle(AppControl):
     def _forwarder_launch_in_flight(self, app_id: str) -> bool:
         """A Steam-forwarder tile whose game window has not mapped yet: the forwarder
         handed the launch to a running Steam and exited before the game drew anything,
-        so its exit says nothing about whether the game is still coming."""
-        app = next((a for a in self._apps if a.id == app_id), None)
-        return (app is not None and app.steam_app_id is not None
-                and self._deferred_hide.is_armed
+        so its exit says nothing about whether the game is still coming.
+
+        Four things have to hold, and the launch is over the moment any of them stops:
+        the tile is still what is in front, the Desktop is still ceded to it, the game
+        has never had a window under this launch, and it has none right now. That third
+        one tells a handoff from an ending: a cold-started game tile *is* the Steam
+        client, so its process ends when Steam quits, long after the game left the
+        screen. Reading the armed *hide* instead would miss all three: it disarms itself
+        a few seconds in whether or not a window ever came.
+        """
+        app = self._app_by_id(app_id)
+        if app is None or app.steam_app_id is None:
+            return False
+        target = self._foreground.current
+        return (isinstance(target, AppTarget) and target.app_id == app_id
+                and self._transitions.show.is_armed
+                and not self._transitions.show.has_seen_window
                 and not self._still_windowed(app_id))
 
-    def _forwarder_launch_timed_out(self, app_id: str) -> None:
-        """The forwarder's window never came within the grace — the launch failed, so
-        take the screen back rather than sit ceded behind nothing."""
-        if self._still_windowed(app_id):
+    def _forwarder_cede_grace_elapsed(self, app_id: str) -> None:
+        """The game's window has not come yet — take the screen back rather than sit
+        ceded behind nothing, and keep expecting it.
+
+        The launch is re-checked rather than assumed: the grace outlives what it was
+        armed for, and one belonging to a launch that has since ended would pull the
+        screen out from under whatever is running now.
+        """
+        if not self._forwarder_launch_in_flight(app_id):
             return
-        logger.info("%s window never mapped; returning to desktop", app_id)
-        self._deferred_hide.cancel()
+        logger.info("%s window has not mapped; returning to the desktop to wait", app_id)
+        self._transitions.hide.cancel()
         self._return_from(app_id)
+        self._awaited_launch = app_id
+
+    def check_awaited_launch(self) -> None:
+        """Cede to a launch whose window outlived its grace — a game that spends minutes
+        on shaders before it draws, over a Desktop that has already come back.
+
+        Only while the Desktop is idle: once the user has put something else in front,
+        the late window is no longer what they asked for.
+        """
+        app_id = self._awaited_launch
+        if app_id is None or not self._foreground.is_idle():
+            return
+        index = self._index_by_id(app_id)
+        if index is None or not self._still_windowed(app_id):
+            return
+        logger.info("%s window mapped after its grace – ceding to it", app_id)
+        self._awaited_launch = None
+        app = self._apps[index]
+        target = AppTarget(index=index, app_id=app.id, name=app.name, is_game=app.is_game)
+        self._foreground.set(target)
+        self.restore_app(target)
 
     def check_active_dyn_gone(self) -> None:
         """Show the Desktop if the active dynamic window was closed by its app."""
@@ -339,8 +384,8 @@ class AppLifecycle(AppControl):
     def reactivate_desktop(self) -> None:
         """Restore Desktop input control and surface it. Idempotent. Resets the
         BTN_MODE trigger so no app-specific HOLD_1S lingers."""
-        self._deferred_show.cancel()
-        self._cede_depth.cancel()
+        self._transitions.show.cancel()
+        self._transitions.cede_depth.cancel()
         self._gamepad.set_app_btn_mode_trigger(Trigger.CLICK)
         self._gamepad.push_handler(self._pad_handler)
         if not self._gamepad.is_connected():
